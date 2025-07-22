@@ -15,6 +15,15 @@ ocv_define_module(imgproc opencv_core WRAP java objc python js)
 
 if(HAVE_METAL)
   ocv_target_link_libraries(${the_module} "-framework Foundation")
+  ocv_target_link_libraries(${the_module} "-framework Metal")
+  ocv_target_link_libraries(${the_module} "-framework MetalPerformanceShaders")
+  ocv_target_link_libraries(${the_module} "-framework CoreGraphics")
+  
+  # Set ARC flags for all Metal .mm files
+  set_source_files_properties(src/metal/filtering.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/metal/geometric.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/metal/morphology.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/metal/matching.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 if(OPENCV_CORE_EXCLUDE_C_API)

@@ -348,6 +348,50 @@ stream.commit(); // OK: Command buffer still valid
 - Include Metal headers only in implementation files
 - Use forward declarations in public headers
 
+### **File Splitting Strategy** ⭐ **PROVEN PATTERN**
+
+When Metal implementation files become large (>600 lines), split them by functional categories:
+
+#### **Successful Split Pattern (imgproc example)**
+```
+modules/imgproc/src/metal/
+├── filtering.mm      # GaussianBlur, Sobel, bilateralFilter, boxFilter, filter2D, medianBlur
+├── geometric.mm      # resize, warpAffine, perspective transforms
+├── morphology.mm     # erode, dilate, morphologyEx
+├── matching.mm       # matchTemplate, feature matching
+└── metal_precomp.hpp # Shared precompiled headers
+```
+
+#### **Split Guidelines**
+- **When to split**: File exceeds ~600 lines or contains 4+ distinct operation categories
+- **Group by functionality**: Operations that share algorithms, data types, or use cases
+- **Naming convention**: `{category}.mm` (descriptive, lowercase)
+- **Shared dependencies**: All split files share the same `metal_precomp.hpp`
+- **Single public API**: Maintain unified header `modules/{module}/include/opencv2/{module}/metal.hpp`
+
+#### **CMake Configuration for Split Files**
+```cmake
+if(HAVE_METAL)
+  ocv_target_link_libraries(${the_module} "-framework Foundation")
+  ocv_target_link_libraries(${the_module} "-framework Metal")
+  ocv_target_link_libraries(${the_module} "-framework MetalPerformanceShaders")
+  ocv_target_link_libraries(${the_module} "-framework CoreGraphics")
+  
+  # Set ARC flags for all Metal .mm files
+  set_source_files_properties(src/metal/filtering.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/metal/geometric.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/metal/morphology.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/metal/matching.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+```
+
+#### **Benefits of Functional Splitting**
+- ✅ **Better maintainability** - Easier to locate and modify specific operations
+- ✅ **Parallel development** - Multiple developers can work on different categories
+- ✅ **Faster compilation** - Changes to one category don't recompile others
+- ✅ **Clearer testing** - Category-specific test failures are easier to debug
+- ✅ **Easier expansion** - New operations fit naturally into existing categories
+
 ### **Error Handling**
 - Use `CV_Assert()` for precondition checks
 - Validate Metal object creation before use
@@ -1114,12 +1158,26 @@ The OpenCV Metal backend provides **high-performance GPU acceleration** for comp
 - **Performance validation** requirements for all new algorithms
 - **Production-ready quality** with comprehensive debugging guidance
 
+## 📚 **Reference Implementations**
+
+### **Successful Split Patterns**
+- **Core Arithmetic**: `modules/core/src/metal/arithm.mm` - OpenCV-compatible custom kernels for multiply/divide
+- **Split Image Processing**: `modules/imgproc/src/metal/` - Functionally organized Metal implementations:
+  - `filtering.mm` - Blur, convolution, and noise reduction operations (604 lines)
+  - `geometric.mm` - Resize, warp, and transformation operations (67 lines)
+  - `morphology.mm` - Erosion, dilation, and morphological operations (119 lines)
+  - `matching.mm` - Template matching and correlation operations (183 lines)
+- **Testing Framework**: `modules/core/test/test_metal.cpp` - Strict tolerances with OpenCV compatibility
+- **Performance Testing**: `modules/imgproc/perf/perf_metal.cpp` - CPU vs Metal comparison methodology
+- **Custom Kernels**: Embedded in respective `.mm` files with texture format conversion patterns
+
 **Key Success Factors:**
 1. **Follow memory management rules** (critical for stability)
 2. **Prioritize OpenCV semantic compatibility** (implement custom kernels when MPS differs)
 3. **Use strict test tolerances** (large differences indicate incorrect implementation)
 4. **Implement stream-based execution** (essential for performance)
 5. **Test thoroughly** in both `test_metal.cpp` and appropriate `perf_metal.cpp` files
+6. **Split by functionality** when files exceed ~600 lines for better maintainability
 
 With these guidelines, future Metal implementations will achieve the same level of **stability, performance, and production readiness** as the current backend.
 

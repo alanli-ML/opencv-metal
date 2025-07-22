@@ -6,6 +6,10 @@
 
 namespace cv { namespace metal {
 
+//==============================================================================
+// GaussianBlur Implementation
+//==============================================================================
+
 void GaussianBlur(const MetalMat& src, MetalMat& dst, Size ksize, double sigmaX, Stream& stream)
 {
     CV_Assert(src.type() == dst.type() || dst.empty());
@@ -39,6 +43,10 @@ void GaussianBlur(const MetalMat& src, MetalMat& dst, Size ksize, double sigmaX)
     GaussianBlur(src, dst, ksize, sigmaX, stream);
     stream.commitAndWait();
 }
+
+//==============================================================================
+// Sobel Implementation
+//==============================================================================
 
 void Sobel(const MetalMat& src, MetalMat& dst, int ddepth, int dx, int dy, int ksize, Stream& stream)
 {
@@ -79,59 +87,9 @@ void Sobel(const MetalMat& src, MetalMat& dst, int ddepth, int dx, int dy, int k
     stream.commitAndWait();
 }
 
-void resize(const MetalMat& src, MetalMat& dst, Size dsize, double fx, double fy, int interpolation, Stream& stream)
-{
-    CV_Assert(!src.empty());
-    Size ssize = src.size();
-
-    if (dsize.empty())
-    {
-        CV_Assert(fx > 0 && fy > 0);
-        dsize = Size(saturate_cast<int>(ssize.width * fx), saturate_cast<int>(ssize.height * fy));
-    }
-    else
-    {
-        CV_Assert(dsize.width > 0 && dsize.height > 0);
-    }
-    CV_Assert(dst.empty() || dst.type() == src.type());
-
-    dst.create(dsize, src.type());
-
-    id<MTLCommandBuffer> commandBuffer = StreamAccessor::getCommandBuffer(stream);
-    CV_Assert(commandBuffer != nil);
-
-    @autoreleasepool {
-        MPSImageScale *scaler = nil;
-
-        switch (interpolation)
-        {
-            case INTER_NEAREST:
-                // Use bilinear scale with filter set to nearest neighbor
-                scaler = [[MPSImageBilinearScale alloc] initWithDevice:MetalContext::getInstance().device];
-                break;
-            case INTER_LINEAR:
-                scaler = [[MPSImageBilinearScale alloc] initWithDevice:MetalContext::getInstance().device];
-                break;
-            case INTER_LANCZOS4:
-                scaler = [[MPSImageLanczosScale alloc] initWithDevice:MetalContext::getInstance().device];
-                break;
-            default:
-                CV_Error(Error::StsBadArg, "Unsupported interpolation type for Metal backend");
-        }
-        CV_Assert(scaler != nil);
-
-        [scaler encodeToCommandBuffer:commandBuffer
-                        sourceTexture:src.texture()
-                   destinationTexture:dst.texture()];
-    }
-}
-
-void resize(const MetalMat& src, MetalMat& dst, Size dsize, double fx, double fy, int interpolation)
-{
-    Stream stream;
-    resize(src, dst, dsize, fx, fy, interpolation, stream);
-    stream.commitAndWait();
-}
+//==============================================================================
+// Custom Filter Shader Sources
+//==============================================================================
 
 static const char* bilateralFilterShaderSource = R"(
 #include <metal_stdlib>
@@ -364,89 +322,11 @@ kernel void filter2D_8UC4_opencv(texture2d<float, access::sample> inTexture [[te
     float4 result = result_int / 255.0f;
     outTexture.write(result, gid);
 }
-
-// OpenCV-compatible template matching kernels
-kernel void matchTemplate_8UC1_CCORR_opencv(texture2d<float, access::sample> imageTexture [[texture(0)]],
-                                            texture2d<float, access::sample> templateTexture [[texture(1)]],
-                                            texture2d<float, access::write> resultTexture [[texture(2)]],
-                                            constant int& template_width [[buffer(0)]],
-                                            constant int& template_height [[buffer(1)]],
-                                            uint2 gid [[thread_position_in_grid]])
-{
-    constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::nearest);
-    if (gid.x >= resultTexture.get_width() || gid.y >= resultTexture.get_height()) return;
-
-    float sum = 0.0f;
-
-    for (int j = 0; j < template_height; ++j) {
-        for (int i = 0; i < template_width; ++i) {
-            // Read from image at offset position
-            float2 image_coord = float2(gid) + float2(i, j);
-            float image_pixel = imageTexture.sample(s, image_coord).r;
-            
-            // Read from template
-            float2 template_coord = float2(i, j);
-            float template_pixel = templateTexture.sample(s, template_coord).r;
-            
-            // Convert to integer range for OpenCV semantics
-            uint image_int = uint(image_pixel * 255.0f + 0.5f);
-            uint template_int = uint(template_pixel * 255.0f + 0.5f);
-            
-            // Cross-correlation (not convolution)
-            sum += float(image_int) * float(template_int);
-        }
-    }
-
-    // Normalize and write result
-    float result = sum / (255.0f * 255.0f); // Normalize to reasonable range
-    resultTexture.write(float4(result, 0, 0, 1), gid);
-}
-
-kernel void matchTemplate_8UC1_CCORR_NORMED_opencv(texture2d<float, access::sample> imageTexture [[texture(0)]],
-                                                   texture2d<float, access::sample> templateTexture [[texture(1)]],
-                                                   texture2d<float, access::write> resultTexture [[texture(2)]],
-                                                   constant int& template_width [[buffer(0)]],
-                                                   constant int& template_height [[buffer(1)]],
-                                                   uint2 gid [[thread_position_in_grid]])
-{
-    constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::nearest);
-    if (gid.x >= resultTexture.get_width() || gid.y >= resultTexture.get_height()) return;
-
-    float sum = 0.0f;
-    float image_sum2 = 0.0f;
-    float template_sum2 = 0.0f;
-
-    for (int j = 0; j < template_height; ++j) {
-        for (int i = 0; i < template_width; ++i) {
-            // Read from image at offset position
-            float2 image_coord = float2(gid) + float2(i, j);
-            float image_pixel = imageTexture.sample(s, image_coord).r;
-            
-            // Read from template
-            float2 template_coord = float2(i, j);
-            float template_pixel = templateTexture.sample(s, template_coord).r;
-            
-            // Convert to integer range for OpenCV semantics
-            uint image_int = uint(image_pixel * 255.0f + 0.5f);
-            uint template_int = uint(template_pixel * 255.0f + 0.5f);
-            
-            float image_f = float(image_int);
-            float template_f = float(template_int);
-            
-            // Cross-correlation
-            sum += image_f * template_f;
-            image_sum2 += image_f * image_f;
-            template_sum2 += template_f * template_f;
-        }
-    }
-
-    // Normalized correlation
-    float norm = sqrt(image_sum2 * template_sum2);
-    float result = (norm > 0.0f) ? (sum / norm) : 0.0f;
-    
-    resultTexture.write(float4(result, 0, 0, 1), gid);
-}
 )";
+
+//==============================================================================
+// BilateralFilter Implementation
+//==============================================================================
 
 void bilateralFilter(const MetalMat& src, MetalMat& dst, int kernel_size, float sigma_color, float sigma_spatial, int borderMode, Stream& stream)
 {
@@ -501,6 +381,10 @@ void bilateralFilter(const MetalMat& src, MetalMat& dst, int kernel_size, float 
     bilateralFilter(src, dst, kernel_size, sigma_color, sigma_spatial, borderMode, stream);
     stream.commitAndWait();
 }
+
+//==============================================================================
+// BoxFilter Implementation
+//==============================================================================
 
 void boxFilter(const MetalMat& src, MetalMat& dst, int ddepth, Size ksize, Point anchor, bool normalize, int borderType, Stream& stream)
 {
@@ -586,6 +470,10 @@ void boxFilter(const MetalMat& src, MetalMat& dst, int ddepth, Size ksize, Point
     boxFilter(src, dst, ddepth, ksize, anchor, normalize, borderType, stream);
     stream.commitAndWait();
 }
+
+//==============================================================================
+// Filter2D Implementation
+//==============================================================================
 
 void filter2D(const MetalMat& src, MetalMat& dst, int ddepth, InputArray kernel, Point anchor, double delta, int borderType, Stream& stream)
 {
@@ -680,107 +568,9 @@ void filter2D(const MetalMat& src, MetalMat& dst, int ddepth, InputArray kernel,
     stream.commitAndWait();
 }
 
-void erode(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor, int iterations, int borderType, const Scalar& borderValue, Stream& stream)
-{
-    CV_Assert(src.depth() == CV_8U || src.depth() == CV_32F);
-    CV_Assert(iterations > 0);
-    CV_Assert(borderType == BORDER_DEFAULT || borderType == BORDER_CONSTANT || borderType == BORDER_REPLICATE);
-
-    Mat kernelMat = kernel.getMat();
-    CV_Assert(kernelMat.rows % 2 == 1 && kernelMat.cols % 2 == 1); // Odd kernel size required
-
-    dst.create(src.size(), src.type());
-
-    id<MTLCommandBuffer> commandBuffer = StreamAccessor::getCommandBuffer(stream);
-    CV_Assert(commandBuffer != nil);
-
-    @autoreleasepool {
-        MPSImageAreaMin *erosion = [[MPSImageAreaMin alloc] initWithDevice:MetalContext::getInstance().device
-                                                               kernelWidth:kernelMat.cols
-                                                              kernelHeight:kernelMat.rows];
-        CV_Assert(erosion != nil);
-        erosion.edgeMode = (borderType == BORDER_REPLICATE) ? MPSImageEdgeModeClamp : MPSImageEdgeModeZero;
-
-        // For multiple iterations, we need to ping-pong between textures
-        MetalMat temp_src = src;
-        MetalMat temp_dst = dst;
-        
-        for (int i = 0; i < iterations; ++i) {
-            if (i > 0) {
-                // Swap source and destination for next iteration
-                temp_src = temp_dst;
-                if (i < iterations - 1) {
-                    // Create temporary texture for intermediate results
-                    temp_dst.create(src.size(), src.type());
-                } else {
-                    temp_dst = dst; // Final iteration writes to output
-                }
-            }
-            
-            [erosion encodeToCommandBuffer:commandBuffer
-                             sourceTexture:temp_src.texture()
-                        destinationTexture:temp_dst.texture()];
-        }
-    }
-}
-
-void erode(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor, int iterations, int borderType, const Scalar& borderValue)
-{
-    Stream stream;
-    erode(src, dst, kernel, anchor, iterations, borderType, borderValue, stream);
-    stream.commitAndWait();
-}
-
-void dilate(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor, int iterations, int borderType, const Scalar& borderValue, Stream& stream)
-{
-    CV_Assert(src.depth() == CV_8U || src.depth() == CV_32F);
-    CV_Assert(iterations > 0);
-    CV_Assert(borderType == BORDER_DEFAULT || borderType == BORDER_CONSTANT || borderType == BORDER_REPLICATE);
-
-    Mat kernelMat = kernel.getMat();
-    CV_Assert(kernelMat.rows % 2 == 1 && kernelMat.cols % 2 == 1); // Odd kernel size required
-
-    dst.create(src.size(), src.type());
-
-    id<MTLCommandBuffer> commandBuffer = StreamAccessor::getCommandBuffer(stream);
-    CV_Assert(commandBuffer != nil);
-
-    @autoreleasepool {
-        MPSImageAreaMax *dilation = [[MPSImageAreaMax alloc] initWithDevice:MetalContext::getInstance().device
-                                                                kernelWidth:kernelMat.cols
-                                                               kernelHeight:kernelMat.rows];
-        CV_Assert(dilation != nil);
-        dilation.edgeMode = (borderType == BORDER_REPLICATE) ? MPSImageEdgeModeClamp : MPSImageEdgeModeZero;
-
-        // For multiple iterations, we need to ping-pong between textures
-        MetalMat temp_src = src;
-        MetalMat temp_dst = dst;
-        
-        for (int i = 0; i < iterations; ++i) {
-            if (i > 0) {
-                // Swap source and destination for next iteration
-                temp_src = temp_dst;
-                if (i < iterations - 1) {
-                    // Create temporary texture for intermediate results
-                    temp_dst.create(src.size(), src.type());
-                } else {
-                    temp_dst = dst; // Final iteration writes to output
-                }
-            }
-            
-            [dilation encodeToCommandBuffer:commandBuffer
-                              sourceTexture:temp_src.texture()
-                         destinationTexture:temp_dst.texture()];
-        }
-    }
-}
-
-void dilate(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor, int iterations, int borderType, const Scalar& borderValue)
-{
-    Stream stream;
-    dilate(src, dst, kernel, anchor, iterations, borderType, borderValue, stream);
-    stream.commitAndWait();
-}
+//==============================================================================
+// MedianBlur Implementation
+//==============================================================================
 
 void medianBlur(const MetalMat& src, MetalMat& dst, int ksize, Stream& stream)
 {
@@ -811,83 +601,4 @@ void medianBlur(const MetalMat& src, MetalMat& dst, int ksize)
     stream.commitAndWait();
 }
 
-void matchTemplate(const MetalMat& image, const MetalMat& templ, MetalMat& result, int method, InputArray mask, Stream& stream)
-{
-    CV_Assert(image.depth() == CV_8U || image.depth() == CV_32F);
-    CV_Assert(image.type() == templ.type());
-    CV_Assert(mask.empty()); // Masks not supported in initial implementation
-    CV_Assert(image.size().width >= templ.size().width && image.size().height >= templ.size().height);
-    CV_Assert(templ.cols() % 2 == 1 && templ.rows() % 2 == 1); // MPS requires odd dimensions
-    
-    // Calculate result size
-    cv::Size result_size(image.cols() - templ.cols() + 1, image.rows() - templ.rows() + 1);
-    result.create(result_size, CV_32FC1);
-
-    id<MTLCommandBuffer> commandBuffer = StreamAccessor::getCommandBuffer(stream);
-    CV_Assert(commandBuffer != nil);
-
-    @autoreleasepool {
-        switch (method) {
-            case TM_CCORR:
-            case TM_CCORR_NORMED: {
-                // For template matching, we need to flip the template for correlation
-                // This is a simplified implementation - full template matching requires
-                // more sophisticated correlation and normalization
-                Mat templ_cpu;
-                templ.download(templ_cpu);
-                
-                // Convert template to weights (simplified approach)
-                if (templ_cpu.channels() == 1) {
-                    Mat templ_f;
-                    templ_cpu.convertTo(templ_f, CV_32F);
-                    
-                    // Flip template for convolution (correlation = convolution with flipped kernel)
-                    Mat templ_flipped;
-                    flip(templ_f, templ_flipped, -1);
-                    
-                    // Create new convolution with template weights
-                    const float* weights = templ_flipped.ptr<float>();
-                    MPSImageConvolution *templateConv = [[MPSImageConvolution alloc]
-                        initWithDevice:MetalContext::getInstance().device
-                        kernelWidth:templ.cols()
-                        kernelHeight:templ.rows()
-                        weights:weights];
-                    CV_Assert(templateConv != nil);
-                    templateConv.edgeMode = MPSImageEdgeModeZero;
-                    
-                    [templateConv encodeToCommandBuffer:commandBuffer
-                                           sourceTexture:image.texture()
-                                      destinationTexture:result.texture()];
-                } else {
-                    CV_Error(Error::StsBadArg, "Multi-channel template matching not implemented yet");
-                }
-                break;
-            }
-            case TM_SQDIFF:
-            case TM_SQDIFF_NORMED: {
-                // Squared difference methods would require custom Metal kernels
-                // For now, fall back to error
-                CV_Error(Error::StsBadArg, "TM_SQDIFF methods not implemented yet - use TM_CCORR");
-                break;
-            }
-            case TM_CCOEFF:
-            case TM_CCOEFF_NORMED: {
-                // Correlation coefficient methods require mean subtraction
-                // Would need custom implementation
-                CV_Error(Error::StsBadArg, "TM_CCOEFF methods not implemented yet - use TM_CCORR");
-                break;
-            }
-            default:
-                CV_Error(Error::StsBadArg, "Unknown template matching method");
-        }
-    }
-}
-
-void matchTemplate(const MetalMat& image, const MetalMat& templ, MetalMat& result, int method, InputArray mask)
-{
-    Stream stream;
-    matchTemplate(image, templ, result, method, mask, stream);
-    stream.commitAndWait();
-}
-
-}} // cv::metal}} // cv::metal
+}} // cv::metal 

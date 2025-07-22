@@ -25,6 +25,24 @@ CV_EXPORTS void resize(const MetalMat& src, MetalMat& dst, Size dsize, double fx
 CV_EXPORTS void bilateralFilter(const MetalMat& src, MetalMat& dst, int kernel_size, float sigma_color, float sigma_spatial, int borderMode = BORDER_DEFAULT);
 CV_EXPORTS void bilateralFilter(const MetalMat& src, MetalMat& dst, int kernel_size, float sigma_color, float sigma_spatial, int borderMode, Stream& stream);
 
+CV_EXPORTS void boxFilter(const MetalMat& src, MetalMat& dst, int ddepth, Size ksize, Point anchor = Point(-1,-1), bool normalize = true, int borderType = BORDER_DEFAULT);
+CV_EXPORTS void boxFilter(const MetalMat& src, MetalMat& dst, int ddepth, Size ksize, Point anchor, bool normalize, int borderType, Stream& stream);
+
+CV_EXPORTS void filter2D(const MetalMat& src, MetalMat& dst, int ddepth, InputArray kernel, Point anchor = Point(-1,-1), double delta = 0, int borderType = BORDER_DEFAULT);
+CV_EXPORTS void filter2D(const MetalMat& src, MetalMat& dst, int ddepth, InputArray kernel, Point anchor, double delta, int borderType, Stream& stream);
+
+CV_EXPORTS void erode(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor = Point(-1,-1), int iterations = 1, int borderType = BORDER_CONSTANT, const Scalar& borderValue = morphologyDefaultBorderValue());
+CV_EXPORTS void erode(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor, int iterations, int borderType, const Scalar& borderValue, Stream& stream);
+
+CV_EXPORTS void dilate(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor = Point(-1,-1), int iterations = 1, int borderType = BORDER_CONSTANT, const Scalar& borderValue = morphologyDefaultBorderValue());
+CV_EXPORTS void dilate(const MetalMat& src, MetalMat& dst, InputArray kernel, Point anchor, int iterations, int borderType, const Scalar& borderValue, Stream& stream);
+
+CV_EXPORTS void medianBlur(const MetalMat& src, MetalMat& dst, int ksize);
+CV_EXPORTS void medianBlur(const MetalMat& src, MetalMat& dst, int ksize, Stream& stream);
+
+CV_EXPORTS void matchTemplate(const MetalMat& image, const MetalMat& templ, MetalMat& result, int method, InputArray mask = noArray());
+CV_EXPORTS void matchTemplate(const MetalMat& image, const MetalMat& templ, MetalMat& result, int method, InputArray mask, Stream& stream);
+
 //! @}
 }} // cv::metal
 
