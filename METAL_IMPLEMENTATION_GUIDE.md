@@ -398,6 +398,41 @@ void analyzeMatDifferences(const Mat& cpu_result, const Mat& metal_result) {
 
 ## 🔮 **Future Development**
 
+### **OpenCV GPU Backend Architecture Reference**
+
+The Metal backend follows established patterns from the **OpenCV CUDA implementation**:
+
+#### **Two-Tier Architecture Model**
+```
+Tier 1: Main Repository (opencv/opencv) - Stable APIs
+├── modules/core/src/cuda/        # Basic CUDA operations  
+├── modules/core/src/metal/       # Basic Metal operations ✅ IMPLEMENTED
+├── modules/imgproc/src/cuda/     # Basic image processing
+└── modules/imgproc/src/metal/    # Basic image processing ✅ IMPLEMENTED
+
+Tier 2: Contrib Repository (opencv/opencv_contrib) - Advanced/Experimental
+├── modules/cudafilters/          # Advanced CUDA filtering
+├── modules/cudaimgproc/          # Advanced CUDA image processing
+├── modules/metalfilters/         # 🔄 FUTURE: Advanced Metal filtering
+└── modules/metalimgproc/         # 🔄 FUTURE: Advanced Metal processing
+```
+
+#### **Evolution Pattern**
+From opencv_contrib documentation: *"When the module matures and gains popularity, it is moved to the central OpenCV repository"*
+
+**Metal Backend Roadmap:**
+1. **✅ Phase 1**: Basic operations in main repository (CURRENT)
+2. **🔄 Phase 2**: Expand stable operations in main repository  
+3. **🔄 Phase 3**: Advanced/experimental operations in contrib-style modules
+4. **🔄 Phase 4**: Mature contrib modules graduate to main repository
+
+**Reference CUDA Contrib Modules** (for Metal expansion patterns):
+- `cudafilters` → `metalfilters`: Advanced filtering operations
+- `cudaimgproc` → `metalimgproc`: Advanced image processing  
+- `cudafeatures2d` → `metalfeatures2d`: Feature detection/matching
+- `cudastereo` → `metalstereo`: Stereo vision algorithms
+- `cudawarping` → `metalwarping`: Advanced geometric transforms
+
 ### **Adding New Algorithms**
 
 #### **Step 1: Implementation**
@@ -430,12 +465,71 @@ void analyzeMatDifferences(const Mat& cpu_result, const Mat& metal_result) {
 3. Run full test suite
 4. Performance validation
 
+### **Creating Contrib-Style Metal Modules** (Future Phase 3)
+
+When expanding beyond basic operations, follow the **opencv_contrib CUDA patterns**:
+
+#### **Module Structure Template** 
+```
+opencv_contrib/modules/metalfilters/
+├── CMakeLists.txt              # Module configuration
+├── doc/
+│   └── metalfilters.markdown   # Module documentation  
+├── include/opencv2/metalfilters.hpp # Public API
+├── src/
+│   ├── metalfilters.mm         # Implementation
+│   └── precomp.hpp            # Precompiled headers
+├── test/
+│   └── test_metalfilters.cpp   # Unit tests
+├── perf/
+│   └── perf_metalfilters.cpp   # Performance tests
+└── samples/
+    └── metalfilters_demo.cpp   # Usage examples
+```
+
+#### **CMakeLists.txt Template**
+```cmake
+set(the_description "Advanced Metal filtering operations")
+ocv_add_module(metalfilters opencv_core opencv_imgproc)
+
+# Metal-specific configuration
+if(HAVE_METAL)
+    set_source_files_properties(src/metalfilters.mm PROPERTIES 
+        COMPILE_FLAGS "-fobjc-arc")
+    ocv_target_link_libraries(${the_module} 
+        "-framework Metal" 
+        "-framework MetalPerformanceShaders"
+        "-framework Foundation")
+endif()
+
+ocv_glob_module_sources()
+ocv_module_include_directories()
+ocv_create_module()
+```
+
+#### **Integration with Main Repository**
+- Add `OPENCV_EXTRA_MODULES_PATH=<opencv_contrib>/modules` to CMake  
+- Follow samme build patterns as CUDA contrib modules
+- Test integration with main repository Metal backend
+
 ### **Expansion Areas**
-1. **More imgproc functions**: morphology, color conversions, advanced filters
-2. **Custom kernels**: For operations not available in MPS
-3. **Features2d support**: Keypoint detection and description
-4. **DNN acceleration**: Neural network inference
-5. **Video processing**: Real-time video pipeline optimization
+
+Following the **OpenCV CUDA contrib patterns** from https://github.com/opencv/opencv_contrib:
+
+#### **Phase 2: Main Repository Expansion (Stable Features)**
+1. **More core operations**: bitwise, matrix operations, statistical functions
+2. **More imgproc functions**: morphology, color conversions, geometric transforms
+3. **Custom Metal kernels**: For operations not available in MPS
+4. **Performance optimizations**: Advanced texture formats, compute shaders
+
+#### **Phase 3: Contrib-Style Advanced Modules (Experimental Features)**  
+Following `opencv_contrib/modules/cuda*` organization patterns:
+1. **metalfilters**: Advanced filtering (bilateral, non-local means, custom filters)
+2. **metalimgproc**: Advanced processing (inpainting, super-resolution, advanced transforms)
+3. **metalfeatures2d**: Keypoint detection and description (SURF, SIFT, ORB)
+4. **metaldnn**: Neural network acceleration using Metal Performance Shaders
+5. **metalstereo**: Stereo vision and depth perception algorithms
+6. **metalwarping**: Advanced geometric transformations and perspective correction
 
 ### **Quality Standards**
 - **All new algorithms** must pass CPU comparison tests
