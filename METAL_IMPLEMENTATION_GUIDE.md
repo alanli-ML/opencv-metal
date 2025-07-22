@@ -2,14 +2,15 @@
 
 ## 📋 **Table of Contents**
 1. [Overview](#overview)
-2. [Architecture & Design Principles](#architecture--design-principles)
-3. [Implementation Guidelines](#implementation-guidelines)
-4. [Testing Requirements](#testing-requirements)
-5. [Performance Evaluation](#performance-evaluation)
-6. [Debugging & Troubleshooting](#debugging--troubleshooting)
-7. [Common Issues & Solutions](#common-issues--solutions)
-8. [Production Deployment](#production-deployment)
-9. [Future Development](#future-development)
+2. [Building OpenCV with Metal Support](#building-opencv-with-metal-support)
+3. [Architecture & Design Principles](#architecture--design-principles)
+4. [Implementation Guidelines](#implementation-guidelines)
+5. [Testing Requirements](#testing-requirements)
+6. [Performance Evaluation](#performance-evaluation)
+7. [Debugging & Troubleshooting](#debugging--troubleshooting)
+8. [Common Issues & Solutions](#common-issues--solutions)
+9. [Production Deployment](#production-deployment)
+10. [Future Development](#future-development)
 
 ---
 
@@ -22,6 +23,231 @@ This guide provides comprehensive instructions for implementing, testing, and de
 - ✅ **1.8-2.4x performance improvement** for chained operations using streams
 - ✅ **Sub-millisecond processing** for most operations
 - ✅ **Industry-standard GPU backend behavior** with appropriate tolerances
+
+---
+
+## 🔧 **Building OpenCV with Metal Support**
+
+### **System Requirements**
+
+#### **Platform Support**
+- **macOS**: 10.13+ (High Sierra and later)
+- **iOS**: 11.0+ (for mobile applications)
+- **Hardware**: Metal-capable Apple GPU (Intel or Apple Silicon Macs)
+- **Development Tools**: Xcode with Metal support
+
+#### **Required Frameworks**
+The Metal backend automatically detects and links these Apple frameworks:
+- `Metal.framework` - Core Metal GPU API
+- `MetalPerformanceShaders.framework` - Optimized GPU algorithms
+- `CoreGraphics.framework` - Graphics processing support
+- `Foundation.framework` - Objective-C runtime support
+
+### **Basic Build Configuration**
+
+#### **Quick Start (Recommended)**
+```bash
+# Create build directory
+mkdir build && cd build
+
+# Configure with Metal support (enabled by default on Apple platforms)
+cmake -DWITH_METAL=ON ..
+
+# Build with parallel jobs
+make -j$(nproc)
+
+# Optional: Install to system
+sudo make install
+```
+
+#### **Complete Build Configuration**
+```bash
+# Advanced configuration with commonly used options
+cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWITH_METAL=ON \
+  -DBUILD_EXAMPLES=ON \
+  -DBUILD_TESTS=ON \
+  -DBUILD_PERF_TESTS=ON \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_INSTALL_PREFIX=/usr/local \
+  ..
+
+# Build
+make -j$(sysctl -n hw.ncpu)  # Use all available CPU cores on macOS
+```
+
+### **CMake Configuration Options**
+
+#### **Metal-Specific Options**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WITH_METAL` | `ON` (Apple platforms) | Enable/disable Metal backend support |
+| `BUILD_opencv_metalfilters` | `ON` (if contrib) | Build advanced Metal filtering module |
+
+#### **Essential Build Options**
+| Option | Recommended | Description |
+|--------|-------------|-------------|
+| `CMAKE_BUILD_TYPE` | `Release` | Build optimization level |
+| `BUILD_SHARED_LIBS` | `ON` | Build dynamic libraries (.dylib) |
+| `BUILD_EXAMPLES` | `ON` | Build sample applications |
+| `BUILD_TESTS` | `ON` | Build unit tests for Metal backend |
+| `BUILD_PERF_TESTS` | `ON` | Build performance benchmarks |
+
+### **Build Verification**
+
+#### **Check Metal Detection**
+During CMake configuration, verify Metal frameworks are detected:
+```
+-- Metal: YES
+--   Metal library: /System/Library/Frameworks/Metal.framework
+--   MetalPerformanceShaders library: /System/Library/Frameworks/MetalPerformanceShaders.framework
+--   CoreGraphics library: /System/Library/Frameworks/CoreGraphics.framework
+```
+
+#### **Verify Installation**
+```bash
+# Test Metal backend availability
+python3 -c "
+import cv2
+print('OpenCV version:', cv2.__version__)
+print('Metal support available:', hasattr(cv2, 'metal'))
+"
+
+# Test basic Metal operations (C++)
+./build/bin/opencv_test_core --gtest_filter="*Metal*"
+./build/bin/opencv_perf_core --gtest_filter="*Metal*"
+```
+
+### **Platform-Specific Configurations**
+
+#### **macOS Development**
+```bash
+# For development with Xcode integration
+cmake -G "Xcode" -DWITH_METAL=ON ..
+open OpenCV.xcodeproj
+```
+
+#### **iOS Cross-Compilation**
+```bash
+# iOS build (requires iOS toolchain)
+cmake \
+  -DCMAKE_TOOLCHAIN_FILE=../platforms/ios/cmake/Toolchains/Toolchain-iPhoneOS_Xcode.cmake \
+  -DWITH_METAL=ON \
+  -DIOS_ARCH="arm64" \
+  ..
+```
+
+#### **Universal Binaries (Intel + Apple Silicon)**
+```bash
+# Build universal binary supporting both architectures
+cmake \
+  -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+  -DWITH_METAL=ON \
+  ..
+```
+
+### **Troubleshooting Build Issues**
+
+#### **Common Problems**
+
+**❌ Metal: NO**
+```bash
+# Check if on Apple platform
+uname -a  # Should show Darwin
+
+# Verify Xcode installation
+xcode-select --print-path
+xcodebuild -version
+
+# Reinstall command line tools if needed
+xcode-select --install
+```
+
+**❌ Framework Linking Errors**
+```bash
+# Clean and reconfigure
+rm -rf build/*
+cmake -DWITH_METAL=ON ..
+```
+
+**❌ Objective-C++ Compilation Errors**
+- Ensure Xcode version supports Metal (Xcode 9.0+)
+- Check that `.mm` files are compiled with Objective-C++ flags
+- Verify ARC (Automatic Reference Counting) is enabled
+
+#### **Advanced Configuration**
+
+**Custom Framework Paths** (if needed):
+```bash
+cmake \
+  -DWITH_METAL=ON \
+  -DMetal_LIBRARY="/path/to/Metal.framework" \
+  -DMetalPerformanceShaders_LIBRARY="/path/to/MetalPerformanceShaders.framework" \
+  ..
+```
+
+**Debug Build with Metal**:
+```bash
+cmake \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DWITH_METAL=ON \
+  -DBUILD_TESTS=ON \
+  ..
+```
+
+### **Integration with Existing Projects**
+
+#### **CMake Integration**
+```cmake
+# In your project's CMakeLists.txt
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
+
+if(OpenCV_FOUND AND APPLE)
+    # Check for Metal support
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${OpenCV_INCLUDE_DIRS})
+    check_cxx_source_compiles("
+        #include <opencv2/core/metal.hpp>
+        int main() { cv::metal::MetalContext::getInstance(); return 0; }
+    " OPENCV_HAS_METAL)
+    
+    if(OPENCV_HAS_METAL)
+        message(STATUS "OpenCV Metal backend available")
+        target_compile_definitions(your_target PRIVATE OPENCV_HAS_METAL)
+    endif()
+endif()
+
+target_link_libraries(your_target ${OpenCV_LIBS})
+```
+
+#### **Pkg-config Integration**
+```bash
+# After installation, verify pkg-config
+pkg-config --modversion opencv4
+pkg-config --cflags opencv4
+pkg-config --libs opencv4
+```
+
+### **Building with OpenCV Contrib (Advanced Metal Modules)**
+
+When using opencv_contrib modules like `metalfilters`:
+
+```bash
+# Download opencv_contrib
+git clone https://github.com/opencv/opencv_contrib.git
+
+# Configure with contrib modules
+cmake \
+  -DOPENCV_EXTRA_MODULES_PATH=../opencv_contrib/modules \
+  -DWITH_METAL=ON \
+  -DBUILD_opencv_metalfilters=ON \
+  ..
+```
+
+**Note**: Advanced Metal modules in contrib require the base Metal backend from this implementation.
+
+---
 
 ---
 
