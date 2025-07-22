@@ -9,7 +9,7 @@ typedef perf::TestBaseWithParam<tuple<Size, MatType>> Core_Arithm;
 
 PERF_TEST_P(Core_Arithm, Add,
     testing::Combine(
-        testing::Values(szVGA, sz720p, sz1080p),
+        testing::Values(perf::szVGA, perf::sz720p, perf::sz1080p),
         testing::Values(CV_8UC4, CV_32FC1, CV_32FC4)
     )
 )
@@ -17,8 +17,9 @@ PERF_TEST_P(Core_Arithm, Add,
     Size sz = get<0>(GetParam());
     int type = get<1>(GetParam());
 
-    Mat src1 = randomMat(sz, type, 0, 255);
-    Mat src2 = randomMat(sz, type, 0, 255);
+    cv::RNG rng;
+    Mat src1 = randomMat(rng, sz, type, 0, 255, false);
+    Mat src2 = randomMat(rng, sz, type, 0, 255, false);
 
     cv::metal::MetalMat d_src1(src1);
     cv::metal::MetalMat d_src2(src2);
@@ -34,7 +35,7 @@ PERF_TEST_P(Core_Arithm, Add,
 
 PERF_TEST_P(Core_Arithm, Subtract,
     testing::Combine(
-        testing::Values(szVGA, sz720p, sz1080p),
+        testing::Values(perf::szVGA, perf::sz720p, perf::sz1080p),
         testing::Values(CV_8UC4, CV_32FC1, CV_32FC4)
     )
 )
@@ -42,8 +43,9 @@ PERF_TEST_P(Core_Arithm, Subtract,
     Size sz = get<0>(GetParam());
     int type = get<1>(GetParam());
 
-    Mat src1 = randomMat(sz, type, 0, 255);
-    Mat src2 = randomMat(sz, type, 0, 255);
+    cv::RNG rng;
+    Mat src1 = randomMat(rng, sz, type, 0, 255, false);
+    Mat src2 = randomMat(rng, sz, type, 0, 255, false);
 
     cv::metal::MetalMat d_src1(src1);
     cv::metal::MetalMat d_src2(src2);
@@ -59,7 +61,7 @@ PERF_TEST_P(Core_Arithm, Subtract,
 
 PERF_TEST_P(Core_Arithm, Multiply,
     testing::Combine(
-        testing::Values(szVGA, sz720p, sz1080p),
+        testing::Values(perf::szVGA, perf::sz720p, perf::sz1080p),
         testing::Values(CV_8UC4, CV_32FC1, CV_32FC4)
     )
 )
@@ -67,8 +69,9 @@ PERF_TEST_P(Core_Arithm, Multiply,
     Size sz = get<0>(GetParam());
     int type = get<1>(GetParam());
 
-    Mat src1 = randomMat(sz, type, 0, 255);
-    Mat src2 = randomMat(sz, type, 0, 255);
+    cv::RNG rng;
+    Mat src1 = randomMat(rng, sz, type, 0, 255, false);
+    Mat src2 = randomMat(rng, sz, type, 0, 255, false);
 
     cv::metal::MetalMat d_src1(src1);
     cv::metal::MetalMat d_src2(src2);
@@ -84,7 +87,7 @@ PERF_TEST_P(Core_Arithm, Multiply,
 
 PERF_TEST_P(Core_Arithm, Divide,
     testing::Combine(
-        testing::Values(szVGA, sz720p, sz1080p),
+        testing::Values(perf::szVGA, perf::sz720p, perf::sz1080p),
         testing::Values(CV_8UC4, CV_32FC1, CV_32FC4)
     )
 )
@@ -92,8 +95,9 @@ PERF_TEST_P(Core_Arithm, Divide,
     Size sz = get<0>(GetParam());
     int type = get<1>(GetParam());
 
-    Mat src1 = randomMat(sz, type, 1, 255);
-    Mat src2 = randomMat(sz, type, 1, 255);
+    cv::RNG rng;
+    Mat src1 = randomMat(rng, sz, type, 1, 255, false);
+    Mat src2 = randomMat(rng, sz, type, 1, 255, false);
 
     cv::metal::MetalMat d_src1(src1);
     cv::metal::MetalMat d_src2(src2);

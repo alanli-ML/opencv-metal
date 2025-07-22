@@ -148,6 +148,34 @@ PERF_TEST_P(Imgproc_ChainedOps, AsyncStream,
     SANITY_CHECK_NOTHING();
 }
 
+// Performance test for bilateralFilter
+typedef perf::TestBaseWithParam<tuple<Size, int>> Imgproc_BilateralFilter;
+PERF_TEST_P(Imgproc_BilateralFilter, Perf,
+    testing::Combine(
+        testing::Values(szVGA, sz720p),
+        testing::Values(5, 9)
+    )
+)
+{
+    Size sz = get<0>(GetParam());
+    int ksize = get<1>(GetParam());
+    int type = CV_8UC4;
+    float sigma_color = 15;
+    float sigma_spatial = 15;
+
+    Mat src(sz, type);
+    randu(src, 0, 255);
+    cv::metal::MetalMat d_src(src);
+    cv::metal::MetalMat d_dst;
+
+    TEST_CYCLE()
+    {
+        cv::metal::bilateralFilter(d_src, d_dst, ksize, sigma_color, sigma_spatial);
+    }
+
+    SANITY_CHECK_NOTHING();
+}
+
 
 }} // namespace
 #endif // HAVE_METAL

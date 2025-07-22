@@ -152,4 +152,7 @@
 /* Library QR-code decoding */
 #cmakedefine HAVE_QUIRC
 
+/* Metal support */
+#cmakedefine HAVE_METAL
+
 #endif // OPENCV_CVCONFIG_H_INCLUDED

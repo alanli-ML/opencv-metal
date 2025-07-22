@@ -47,6 +47,52 @@ MetalContext& MetalContext::getInstance()
     return instance;
 }
 
+id<MTLFunction> MetalContext::getMetalFunction(const std::string& kernelSource, const std::string& functionName, bool isMpsAvailable)
+{
+    std::lock_guard<Mutex> lock(cacheMutex);
+
+    // Check function cache first
+    auto funcIt = functionCache.find(functionName);
+    if (funcIt != functionCache.end()) {
+        return funcIt->second;
+    }
+
+    // Check library cache
+    id<MTLLibrary> library = nil;
+    auto libIt = libraryCache.find(kernelSource);
+    if (libIt != libraryCache.end()) {
+        library = libIt->second;
+    } else {
+        // Compile new library
+        NSError *error = nil;
+        NSString *sourceString = [NSString stringWithUTF8String:kernelSource.c_str()];
+        MTLCompileOptions *options = [MTLCompileOptions new];
+
+        if (isMpsAvailable)
+        {
+            // Allow MPS data types if needed
+            options.preprocessorMacros = @{ @"MPS_TYPES_IMPL" : @"" };
+        }
+
+        library = [device newLibraryWithSource:sourceString options:options error:&error];
+        if (!library) {
+            CV_Error(Error::StsError, [error.localizedDescription cStringUsingEncoding:NSUTF8StringEncoding]);
+        }
+        libraryCache[kernelSource] = library;
+    }
+
+    // Get function from library
+    NSString *functionNameString = [NSString stringWithUTF8String:functionName.c_str()];
+    id<MTLFunction> function = [library newFunctionWithName:functionNameString];
+    if (!function) {
+        CV_Error(Error::StsError, "Failed to find Metal function: " + functionName);
+    }
+
+    // Cache and return function
+    functionCache[functionName] = function;
+    return function;
+}
+
 static int getCVPixelFormatFromMetal(MTLPixelFormat pixelFormat)
 {
     switch(pixelFormat)

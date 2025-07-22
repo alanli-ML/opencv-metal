@@ -6,6 +6,7 @@
 #define OPENCV_CORE_METAL_WRAPPER_HPP
 
 #include "opencv2/core/metal.hpp"
+#include <map>
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -24,11 +25,17 @@ public:
 
     static MetalContext& getInstance();
 
+    id<MTLFunction> getMetalFunction(const std::string& kernelSource, const std::string& functionName, bool isMpsAvailable = true);
+
 private:
     MetalContext();
     // disable copy/assignment
     MetalContext(const MetalContext&);
     MetalContext& operator=(const MetalContext&);
+
+    std::map<std::string, id<MTLLibrary>> libraryCache;
+    std::map<std::string, id<MTLFunction>> functionCache;
+    Mutex cacheMutex;
 };
 
 class Stream::Impl

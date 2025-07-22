@@ -9,6 +9,10 @@
 
 #include "opencv2/core.hpp"
 
+namespace cv {
+class Algorithm;
+}
+
 // Forward declaration for Objective-C types
 #ifdef __OBJC__
 @protocol MTLTexture;

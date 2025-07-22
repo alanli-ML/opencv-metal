@@ -22,6 +22,9 @@ CV_EXPORTS void Sobel(const MetalMat& src, MetalMat& dst, int ddepth, int dx, in
 CV_EXPORTS void resize(const MetalMat& src, MetalMat& dst, Size dsize, double fx = 0, double fy = 0, int interpolation = INTER_LINEAR);
 CV_EXPORTS void resize(const MetalMat& src, MetalMat& dst, Size dsize, double fx, double fy, int interpolation, Stream& stream);
 
+CV_EXPORTS void bilateralFilter(const MetalMat& src, MetalMat& dst, int kernel_size, float sigma_color, float sigma_spatial, int borderMode = BORDER_DEFAULT);
+CV_EXPORTS void bilateralFilter(const MetalMat& src, MetalMat& dst, int kernel_size, float sigma_color, float sigma_spatial, int borderMode, Stream& stream);
+
 //! @}
 }} // cv::metal
 

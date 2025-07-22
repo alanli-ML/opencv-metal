@@ -31,3 +31,10 @@ repomix-output.xml
 repomix.config.json
 .repomixignore
 implementation_plan.md
+modules/cudaimgproc_reference
+modules/cudafilters_reference
+claude-flow.bat
+claude-flow
+claude-flow.config.json
+claude-flow.ps1
+memory/claude-flow-data.json
