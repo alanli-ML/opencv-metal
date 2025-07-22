@@ -1,15 +1,18 @@
 @cond CUDA_MODULES
-GPU-Accelerated Computer Vision (cuda module) {#tutorial_table_of_content_gpu}
+GPU-Accelerated Computer Vision {#tutorial_table_of_content_gpu}
 =============================================
 
 Squeeze out every little computation power from your system by using the power of your video card to
 run the OpenCV algorithms.
 
+CUDA Backend (cuda module)
+--------------------------
+
 -   @subpage tutorial_gpu_basics_similarity
 
     *Languages:* C++
 
-    *Compatibility:* \> OpenCV 2.0
+    *Compatibility:* > OpenCV 2.0
 
     *Author:* Bernát Gábor
 
@@ -21,8 +24,23 @@ run the OpenCV algorithms.
 
     *Languages:* C++
 
-    *Compatibility:* \>= OpenCV 3.0
+    *Compatibility:* >= OpenCV 3.0
 
     This tutorial will show you how to wrap a GpuMat into a thrust iterator in order to be able to
     use the functions in the thrust library.
+@endcond
+
+@cond HAVE_METAL
+Metal Backend
+-------------
+
+-   @subpage tutorial_metal_basics
+
+    *Languages:* C++
+
+    *Compatibility:* > OpenCV 4.x
+
+    This tutorial gives an introduction to the Metal backend, explaining how to use `cv::metal::MetalMat`
+    and `cv::metal::Stream` to build efficient, hardware-accelerated image processing pipelines on
+    Apple platforms.
 @endcond

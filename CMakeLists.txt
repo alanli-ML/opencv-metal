@@ -137,6 +137,10 @@ if(OPENCV_WORKAROUND_CMAKE_20989)
   set(CMAKE_SYSTEM_PROCESSOR ${CMAKE_SYSTEM_PROCESSOR_BACKUP})
 endif()
 
+if(APPLE)
+  enable_language(OBJCXX)
+endif()
+
 enable_testing()
 
 ocv_cmake_hook(POST_CMAKE_BOOTSTRAP)
@@ -244,6 +248,9 @@ OCV_OPTION(WITH_VTK "Include VTK library support (and build opencv_viz module ei
 OCV_OPTION(WITH_CUDA "Include NVidia Cuda Runtime support" OFF
   VISIBLE_IF NOT IOS AND NOT XROS AND NOT WINRT
   VERIFY HAVE_CUDA)
+OCV_OPTION(WITH_METAL "Include Apple Metal support" ON
+  VISIBLE_IF APPLE
+  VERIFY HAVE_METAL)
 OCV_OPTION(WITH_CUFFT "Include NVidia Cuda Fast Fourier Transform (FFT) library support" WITH_CUDA
   VISIBLE_IF WITH_CUDA
   VERIFY HAVE_CUFFT)
@@ -881,6 +888,11 @@ endif()
 # --- OpenCL ---
 if(WITH_OPENCL)
   include(cmake/OpenCVDetectOpenCL.cmake)
+endif()
+
+# --- Metal ---
+if(WITH_METAL)
+  include(cmake/OpenCVDetectMetal.cmake)
 endif()
 
 # --- Halide ---
@@ -1890,6 +1902,11 @@ if(WITH_VULKAN OR HAVE_VULKAN)
     status("    Include path:"  VULKAN_INCLUDE_DIRS THEN "${VULKAN_INCLUDE_DIRS}" ELSE "NO")
     status("    Link libraries:" VULKAN_LIBRARIES THEN "${VULKAN_LIBRARIES}" ELSE "Dynamic load")
   endif()
+endif()
+
+if(WITH_METAL OR HAVE_METAL)
+  status("")
+  status("  Metal:" HAVE_METAL THEN "YES" ELSE "NO")
 endif()
 
 if(WITH_WEBNN OR HAVE_WEBNN)

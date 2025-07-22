@@ -25,3 +25,9 @@ build
 node_modules
 CMakeSettings.json
 xcuserdata/
+
+# Repomix output files
+repomix-output.xml
+repomix.config.json
+.repomixignore
+implementation_plan.md

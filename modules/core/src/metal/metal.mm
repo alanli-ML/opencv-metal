@@ -1,0 +1,433 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+#include "../precomp.hpp"
+#include "metal_precomp.hpp"
+#include "metal_wrapper.hpp"
+// Removed imgproc dependency to avoid circular dependency
+
+// This file will be populated with Objective-C++ code.
+// The .mm extension allows mixing C++ and Objective-C.
+
+namespace cv { namespace metal {
+
+class MetalMatData
+{
+public:
+    MetalMatData();
+    ~MetalMatData();
+
+private:
+    friend class MetalMat;
+    id<MTLTexture> texture;
+};
+
+MetalMatData::MetalMatData() : texture(nil) {}
+MetalMatData::~MetalMatData()
+{
+    // ARC will release the texture when this object is destroyed.
+}
+
+MetalContext::MetalContext()
+{
+    @autoreleasepool {
+        device = MTLCreateSystemDefaultDevice();
+        if (!device)
+        {
+            CV_Error(Error::StsError, "Metal is not supported on this device");
+        }
+        commandQueue = [device newCommandQueue];
+    }
+}
+
+MetalContext& MetalContext::getInstance()
+{
+    static MetalContext instance;
+    return instance;
+}
+
+static int getCVPixelFormatFromMetal(MTLPixelFormat pixelFormat)
+{
+    switch(pixelFormat)
+    {
+        case MTLPixelFormatR8Unorm: return CV_8UC1;
+        case MTLPixelFormatBGRA8Unorm: return CV_8UC4;
+        case MTLPixelFormatR32Float: return CV_32FC1;
+        case MTLPixelFormatRGBA32Float: return CV_32FC4;
+        default: return -1;
+    }
+}
+
+static MTLPixelFormat getMetalPixelFormat(int type)
+{
+    int depth = CV_MAT_DEPTH(type);
+    int cn = CV_MAT_CN(type);
+    switch(depth)
+    {
+        case CV_8U:
+            switch(cn)
+            {
+                case 1: return MTLPixelFormatR8Unorm;
+                case 4: return MTLPixelFormatBGRA8Unorm; // OpenCV's default for 4-channel 8U is BGRA
+            }
+            break;
+        case CV_32F:
+            switch(cn)
+            {
+                case 1: return MTLPixelFormatR32Float;
+                case 4: return MTLPixelFormatRGBA32Float;
+            }
+            break;
+    }
+    return MTLPixelFormatInvalid;
+}
+
+MetalMat::MetalMat()
+: flags(0), rows_(0), cols_(0), u(0), offset(0), texture_not_owned_(nil)
+{
+    step[0] = step[1] = 0;
+}
+
+MetalMat::MetalMat(int _rows, int _cols, int _type)
+    : flags(0), rows_(0), cols_(0), u(0), offset(0), texture_not_owned_(nil)
+{
+    step[0] = step[1] = 0;
+    create(_rows, _cols, _type);
+}
+
+MetalMat::MetalMat(const Mat& m)
+    : flags(0), rows_(0), cols_(0), u(0), offset(0), texture_not_owned_(nil)
+{
+    step[0] = step[1] = 0;
+    upload(m);
+}
+
+MetalMat::MetalMat(Size size, int type)
+    : flags(0), rows_(0), cols_(0), u(0), offset(0), texture_not_owned_(nil)
+{
+    step[0] = step[1] = 0;
+    create(size.height, size.width, type);
+}
+
+MetalMat::MetalMat(id texture)
+    : flags(0), rows_(0), cols_(0), u(), offset(0), texture_not_owned_(texture)
+{
+    step[0] = step[1] = 0;
+    if (texture == nil) {
+        texture_not_owned_ = nil;
+        return;
+    }
+
+    @autoreleasepool {
+        id<MTLTexture> tex = (id<MTLTexture>)texture;
+        int cv_type = getCVPixelFormatFromMetal([tex pixelFormat]);
+        if (cv_type == -1)
+            CV_Error(Error::StsUnsupportedFormat, "Unsupported MTLTexture pixel format for MetalMat wrapping");
+
+        flags = Mat::MAGIC_VAL + cv_type;
+        rows_ = (int)[tex height];
+        cols_ = (int)[tex width];
+        step[0] = cols_ * elemSize();
+        step[1] = elemSize();
+    }
+}
+
+
+MetalMat::~MetalMat()
+{
+    release();
+}
+
+MetalMat::MetalMat(const MetalMat& m)
+    : flags(m.flags), rows_(m.rows_), cols_(m.cols_), u(m.u), offset(m.offset), texture_not_owned_(m.texture_not_owned_)
+{
+    step[0] = m.step[0];
+    step[1] = m.step[1];
+}
+
+MetalMat& MetalMat::operator=(const MetalMat& m)
+{
+    if (this != &m)
+    {
+        u = m.u;
+        texture_not_owned_ = m.texture_not_owned_;
+        flags = m.flags;
+        rows_ = m.rows_;
+        cols_ = m.cols_;
+        offset = m.offset;
+        step[0] = m.step[0];
+        step[1] = m.step[1];
+    }
+    return *this;
+}
+
+MetalMat MetalMat::clone() const
+{
+    MetalMat m;
+    if (empty())
+        return m;
+
+    m.create(rows_, cols_, type());
+
+    @autoreleasepool {
+        Stream stream;
+        id<MTLCommandBuffer> commandBuffer = StreamAccessor::getCommandBuffer(stream);
+        id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+
+        [blitEncoder copyFromTexture:texture()
+                         sourceSlice:0
+                         sourceLevel:0
+                        sourceOrigin:{0, 0, 0}
+                          sourceSize:{(NSUInteger)cols_, (NSUInteger)rows_, 1}
+                           toTexture:m.texture()
+                    destinationSlice:0
+                    destinationLevel:0
+                   destinationOrigin:{0, 0, 0}];
+        [blitEncoder endEncoding];
+        stream.commitAndWait();
+    }
+    return m;
+}
+
+MetalMat::MetalMat(const MetalMat& m, const Rect& roi)
+    : flags(0), rows_(0), cols_(0), u(0), offset(0), texture_not_owned_(nil)
+{
+    step[0] = step[1] = 0;
+    CV_Assert(!m.empty());
+    CV_Assert(roi.x >= 0 && roi.y >= 0 && roi.width >= 0 && roi.height >= 0 &&
+              roi.x + roi.width <= m.cols_ && roi.y + roi.height <= m.rows_);
+    if (roi.width == 0 || roi.height == 0)
+        return;
+
+    create(roi.height, roi.width, m.type());
+
+    @autoreleasepool {
+        Stream stream;
+        id<MTLCommandBuffer> commandBuffer = StreamAccessor::getCommandBuffer(stream);
+        id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+
+        MTLOrigin srcOrigin = {(NSUInteger)roi.x, (NSUInteger)roi.y, 0};
+        MTLSize srcSize = {(NSUInteger)roi.width, (NSUInteger)roi.height, 1};
+        MTLOrigin dstOrigin = {0, 0, 0};
+
+        [blitEncoder copyFromTexture:m.texture()
+                         sourceSlice:0
+                         sourceLevel:0
+                        sourceOrigin:srcOrigin
+                          sourceSize:srcSize
+                           toTexture:texture()
+                    destinationSlice:0
+                    destinationLevel:0
+                   destinationOrigin:dstOrigin];
+
+        [blitEncoder endEncoding];
+        stream.commitAndWait();
+    }
+}
+
+MetalMat::MetalMat(const MetalMat& m, const Range& rowRange, const Range& colRange)
+{
+    *this = MetalMat(m, Rect(colRange.start, rowRange.start, colRange.size(), rowRange.size()));
+}
+
+
+MetalMat MetalMat::operator()(const Range& rowRange, const Range& colRange) const
+{
+    return MetalMat(*this, rowRange, colRange);
+}
+
+MetalMat MetalMat::operator()(const Rect& roi) const
+{
+    return MetalMat(*this, roi);
+}
+
+void MetalMat::create(int _rows, int _cols, int _type)
+{
+    _type = CV_MAT_TYPE(_type);
+    if (u && rows_ == _rows && cols_ == _cols && type() == _type)
+        return;
+
+    release();
+    texture_not_owned_ = nil;
+
+    if (_rows <= 0 || _cols <= 0)
+        return;
+
+    @autoreleasepool {
+        flags = Mat::MAGIC_VAL + _type;
+        rows_ = _rows;
+        cols_ = _cols;
+        offset = 0;
+        step[0] = cols_ * elemSize();
+        step[1] = elemSize();
+
+        u = makePtr<MetalMatData>();
+
+        MetalContext& ctx = MetalContext::getInstance();
+        MTLPixelFormat pixelFormat = getMetalPixelFormat(type());
+        if (pixelFormat == MTLPixelFormatInvalid)
+        {
+            CV_Error(Error::StsUnsupportedFormat, "Unsupported MetalMat format");
+        }
+
+        MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:pixelFormat
+            width:_cols
+            height:_rows
+            mipmapped:NO];
+
+        textureDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+
+        u->texture = [ctx.device newTextureWithDescriptor:textureDescriptor];
+
+        if (!u->texture)
+        {
+            CV_Error(Error::StsError, "Failed to create MTLTexture");
+        }
+    }
+}
+
+void MetalMat::create(Size _size, int _type)
+{
+    create(_size.height, _size.width, _type);
+}
+
+void MetalMat::upload(const Mat& m)
+{
+    CV_Assert(!m.empty());
+    int _type = m.type();
+    int _cn = m.channels();
+
+    if (_cn == 3)
+    {
+        _type = CV_MAKETYPE(m.depth(), 4);
+    }
+
+    create(m.rows, m.cols, _type);
+    CV_Assert(u && u->texture);
+
+    @autoreleasepool {
+        Mat src_to_upload;
+        if (_cn == 3)
+        {
+            // Convert BGR to BGRA manually to avoid imgproc dependency
+            src_to_upload.create(m.size(), CV_8UC4);
+            const uchar* src_ptr = m.ptr<uchar>();
+            uchar* dst_ptr = src_to_upload.ptr<uchar>();
+            int total_pixels = m.rows * m.cols;
+            for (int i = 0; i < total_pixels; i++)
+            {
+                dst_ptr[i*4 + 0] = src_ptr[i*3 + 0]; // B
+                dst_ptr[i*4 + 1] = src_ptr[i*3 + 1]; // G
+                dst_ptr[i*4 + 2] = src_ptr[i*3 + 2]; // R
+                dst_ptr[i*4 + 3] = 255;              // A
+            }
+        }
+        else
+        {
+            src_to_upload = m;
+        }
+
+        MTLRegion region = MTLRegionMake2D(0, 0, (NSUInteger)cols_, (NSUInteger)rows_);
+        [u->texture replaceRegion:region
+                    mipmapLevel:0
+                    withBytes:src_to_upload.data
+                    bytesPerRow:src_to_upload.step];
+    }
+}
+
+void MetalMat::download(Mat& m) const
+{
+    CV_Assert(!empty());
+    m.create(rows_, cols_, type());
+
+    @autoreleasepool {
+        MTLRegion region = MTLRegionMake2D(0, 0, (NSUInteger)cols_, (NSUInteger)rows_);
+
+        [u->texture getBytes:m.data
+                 bytesPerRow:m.step
+                 fromRegion:region
+                 mipmapLevel:0];
+    }
+}
+
+bool MetalMat::empty() const
+{
+    return !u && !texture_not_owned_;
+}
+
+id MetalMat::texture() const
+{
+    return u ? u->texture : (id<MTLTexture>)texture_not_owned_;
+}
+
+void MetalMat::release()
+{
+    u.release();
+    texture_not_owned_ = nil;
+    rows_ = cols_ = 0;
+    offset = 0;
+    step[0] = step[1] = 0;
+    flags = 0;
+}
+
+// Stream Implementation
+Stream::Impl::Impl() : commandBuffer(nil), owns_command_buffer(true) {}
+Stream::Impl::Impl(id<MTLCommandBuffer> cmdBuf) : commandBuffer(cmdBuf), owns_command_buffer(false) {}
+Stream::Impl::~Impl() {}
+
+id<MTLCommandBuffer> Stream::Impl::getCommandBuffer()
+{
+    if (commandBuffer == nil || ([commandBuffer status] >= MTLCommandBufferStatusCommitted && owns_command_buffer))
+    {
+        MetalContext& ctx = MetalContext::getInstance();
+        commandBuffer = [ctx.commandQueue commandBuffer];
+    }
+    return commandBuffer;
+}
+
+Stream::Stream() { impl = makePtr<Impl>(); }
+Stream::Stream(id commandBuffer) { impl = makePtr<Impl>((id<MTLCommandBuffer>)commandBuffer); }
+Stream::~Stream() {}
+Stream::Stream(const Stream& s) : impl(s.impl) {}
+Stream& Stream::operator=(const Stream& s) { impl = s.impl; return *this; }
+
+void Stream::commit()
+{
+    if (impl && impl->commandBuffer && impl->owns_command_buffer)
+    {
+        [impl->commandBuffer commit];
+    }
+}
+
+void Stream::waitUntilCompleted()
+{
+    if (impl && impl->commandBuffer && impl->owns_command_buffer)
+    {
+        [impl->commandBuffer waitUntilCompleted];
+    }
+}
+
+void Stream::commitAndWait()
+{
+    if (impl && impl->commandBuffer && impl->owns_command_buffer)
+    {
+        [impl->commandBuffer commit];
+        [impl->commandBuffer waitUntilCompleted];
+    }
+}
+
+bool Stream::hasEnqueuedCommands() const
+{
+    return impl && impl->commandBuffer && ([impl->commandBuffer status] == MTLCommandBufferStatusEnqueued || [impl->commandBuffer status] == MTLCommandBufferStatusNotEnqueued);
+}
+
+id StreamAccessor::getCommandBuffer(const Stream& stream)
+{
+    if (!stream.impl)
+        return nil;
+    return stream.impl->getCommandBuffer();
+}
+
+}} // cv::metal
