@@ -45,7 +45,9 @@ ocv_add_accuracy_tests()
 
 # Conditional Metal Graph Cut Support
 target_compile_definitions(${the_module} PRIVATE USE_METAL_GRAPHCUT=0)
-target_compile_definitions(opencv_test_metalimgproc PRIVATE USE_METAL_GRAPHCUT=0)
+if(BUILD_TESTS AND TARGET opencv_test_metalimgproc)
+  target_compile_definitions(opencv_test_metalimgproc PRIVATE USE_METAL_GRAPHCUT=0)
+endif()
 
 if(HAVE_METAL)
   ocv_add_perf_tests()

@@ -1399,12 +1399,6 @@ double kmeans(const MetalMat& data, int K, MetalMat& bestLabels,
 }
 
 // Mask-based K-means for GrabCut initialization
-// 
-// IMPORTANT: This function outputs labels with the following behavior:
-// - For pixels belonging to the target class (useBackground determines which), 
-//   outLabels contains valid k-means cluster IDs (0 to K-1)
-// - For pixels NOT belonging to the target class, outLabels contains default value 0
-// - Callers must check the mask to determine which pixels have valid labels!
 void kmeansClusterByMask(const MetalMat& inImg, const MetalMat& mask, bool useBackground,
                         MetalMat& outLabels, cv::Mat& centroids, Stream& stream) {
     CV_Assert(!inImg.empty());

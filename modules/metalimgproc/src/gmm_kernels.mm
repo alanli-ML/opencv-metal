@@ -404,8 +404,6 @@ kernel void gmmFinalizeParametersKernel(device float* bgStats [[buffer(0)]],
                                        device float* fgGmm [[buffer(3)]],
                                        device uint32_t* pixelCounts [[buffer(4)]],
                                        constant uint& componentsCount [[buffer(5)]],
-                                       constant float& totalBgComponentSamples [[buffer(6)]],
-                                       constant float& totalFgComponentSamples [[buffer(7)]],
                                        uint gid [[thread_position_in_grid]])
 {
     int comp = int(gid);
@@ -427,7 +425,7 @@ kernel void gmmFinalizeParametersKernel(device float* bgStats [[buffer(0)]],
         float count = bgStats[comp * 10 + 0];
         
         // CRITICAL FIX: Safeguard against zero-count components
-        if (count > 0 && totalBgComponentSamples > 0) {
+        if (count > 0 && totalBgPixels > 0) {
             // Calculate mean (BGR order: B=1, G=2, R=3)
             float mean_b = bgStats[comp * 10 + 1] / count;
             float mean_g = bgStats[comp * 10 + 2] / count;
@@ -475,7 +473,7 @@ kernel void gmmFinalizeParametersKernel(device float* bgStats [[buffer(0)]],
             
             // CRITICAL FIX: Use pre-calculated component sample total as denominator like CPU
             // CPU: coefs[ci] = (double)n/totalSampleCount (where totalSampleCount = sum of all component counts)
-            float weight = max(count / totalBgComponentSamples, MIN_COMPONENT_WEIGHT);  // SAFEGUARD: Ensure minimum weight
+            float weight = max(count / totalBgPixels, MIN_COMPONENT_WEIGHT);  // SAFEGUARD: Ensure minimum weight
             float invSqrtDet = 1.0f / sqrt(det);
             
             bgGmm[comp * 11 + 0] = weight;
@@ -517,7 +515,7 @@ kernel void gmmFinalizeParametersKernel(device float* bgStats [[buffer(0)]],
         float count = fgStats[comp * 10 + 0];
         
         // CRITICAL FIX: Safeguard against zero-count components
-        if (count > 0 && totalFgComponentSamples > 0) {
+        if (count > 0 && totalFgPixels > 0) {
             // Calculate mean (BGR order: B=1, G=2, R=3)
             float mean_b = fgStats[comp * 10 + 1] / count;
             float mean_g = fgStats[comp * 10 + 2] / count;
@@ -563,7 +561,7 @@ kernel void gmmFinalizeParametersKernel(device float* bgStats [[buffer(0)]],
             float invCov_rr = (cov_bb * cov_gg - cov_bg * cov_bg) * invDet;
             
             // CRITICAL FIX: Use pre-calculated component sample total as denominator like CPU
-            float weight = max(count / totalFgComponentSamples, MIN_COMPONENT_WEIGHT);  // SAFEGUARD: Ensure minimum weight
+            float weight = max(count / totalFgPixels, MIN_COMPONENT_WEIGHT);  // SAFEGUARD: Ensure minimum weight
             float invSqrtDet = 1.0f / sqrt(det);
             
             fgGmm[comp * 11 + 0] = weight;

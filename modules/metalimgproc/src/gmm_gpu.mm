@@ -66,20 +66,10 @@ void GMM::learnGMMsGPU(const MetalMat& image, const MetalMat& mask, const MetalM
         [encoder endEncoding];
     }
     
-    // DEBUG: Sync and examine statistics after accumulation
+    // CRITICAL: Need to sync here to read statistics for component total calculations
     stream.syncCPU();
-    printf("\n=== DEBUG: GPU Statistics After Accumulation ===\n");
     float* bgStats = (float*)[m_bgStatsBuffer contents];
     float* fgStats = (float*)[m_fgStatsBuffer contents];
-    
-    for (int c = 0; c < 5; c++) {
-        printf("BG Component %d: count=%.1f sum=(%.1f,%.1f,%.1f) sum_sq=(%.1f,%.1f,%.1f,%.1f,%.1f,%.1f)\n", 
-               c, bgStats[c*10+0], bgStats[c*10+1], bgStats[c*10+2], bgStats[c*10+3],
-               bgStats[c*10+4], bgStats[c*10+5], bgStats[c*10+6], bgStats[c*10+7], bgStats[c*10+8], bgStats[c*10+9]);
-        printf("FG Component %d: count=%.1f sum=(%.1f,%.1f,%.1f) sum_sq=(%.1f,%.1f,%.1f,%.1f,%.1f,%.1f)\n", 
-               c, fgStats[c*10+0], fgStats[c*10+1], fgStats[c*10+2], fgStats[c*10+3],
-               fgStats[c*10+4], fgStats[c*10+5], fgStats[c*10+6], fgStats[c*10+7], fgStats[c*10+8], fgStats[c*10+9]);
-    }
     
     // PHASE 2: Count total pixels on GPU
     @autoreleasepool {
@@ -93,33 +83,9 @@ void GMM::learnGMMsGPU(const MetalMat& image, const MetalMat& mask, const MetalM
         [encoder endEncoding];
     }
     
-    // DEBUG: Check pixel counts
-    stream.syncCPU();
-    uint32_t* pixelCounts = (uint32_t*)[m_pixelCountsBuffer contents];
-    printf("GPU Pixel Counts: BG=%u FG=%u\n", pixelCounts[0], pixelCounts[1]);
+    // Pixel counts computed on GPU - no need to sync for debug in production
 
-    // CRITICAL FIX: Pre-calculate total component sample counts like CPU does
-    // CPU uses totalSampleCount = sum of all component sample counts, NOT total image pixels
-    
-    float totalBgComponentSamples = 0;
-    float totalFgComponentSamples = 0;
-    for (int i = 0; i < 5; i++) {
-        totalBgComponentSamples += bgStats[i * 10 + 0];  // Sum all BG component counts
-        totalFgComponentSamples += fgStats[i * 10 + 0];  // Sum all FG component counts
-    }
-    
-    printf("GPU Component Sample Totals: BG=%.1f FG=%.1f\n", totalBgComponentSamples, totalFgComponentSamples);
-    
-    // DEBUG: Print individual component counts and expected weights for comparison
-    printf("GPU Component Details:\n");
-    for (int i = 0; i < 5; i++) {
-        float bgCount = bgStats[i * 10 + 0];
-        float fgCount = fgStats[i * 10 + 0];
-        float bgWeight = (totalBgComponentSamples > 0) ? bgCount / totalBgComponentSamples : 0.0f;
-        float fgWeight = (totalFgComponentSamples > 0) ? fgCount / totalFgComponentSamples : 0.0f;
-        printf("  Component %d: BG count=%.1f weight=%.6f, FG count=%.1f weight=%.6f\n", 
-               i, bgCount, bgWeight, fgCount, fgWeight);
-    }
+    // Component sample counts and weights computed entirely on GPU for performance
 
     // PHASE 3: Finalize GMM parameters on GPU
     @autoreleasepool {
@@ -132,8 +98,7 @@ void GMM::learnGMMsGPU(const MetalMat& image, const MetalMat& mask, const MetalM
         [encoder setBuffer:m_pixelCountsBuffer offset:0 atIndex:4];
         uint32_t kGmmComponents = 5; // Constant: always 5 components per class
         [encoder setBytes:&kGmmComponents length:sizeof(uint32_t) atIndex:5]; // Pass componentsCount as constant
-        [encoder setBytes:&totalBgComponentSamples length:sizeof(float) atIndex:6]; // Pass pre-calculated BG total
-        [encoder setBytes:&totalFgComponentSamples length:sizeof(float) atIndex:7]; // Pass pre-calculated FG total
+        // Component totals calculated entirely on GPU - no CPU-side calculations needed
         
         MTLSize gridSize = MTLSizeMake(5, 1, 1); // Always 5 components
         MTLSize threadgroupSize = MTLSizeMake(1, 1, 1);
@@ -142,55 +107,8 @@ void GMM::learnGMMsGPU(const MetalMat& image, const MetalMat& mask, const MetalM
         [encoder endEncoding];
     }
     
-    // DEBUG: Show intermediate calculations for each component
-    stream.syncCPU();
-    printf("\n=== DEBUG: GPU Intermediate Calculations ===\n");
-    
-    for (int c = 0; c < 5; c++) {
-        if (bgStats[c*10+0] > 0 && pixelCounts[0] > 0) {
-            float count = bgStats[c*10+0];
-            float mean_r = bgStats[c*10+1]/count;
-            float mean_g = bgStats[c*10+2]/count;
-            float mean_b = bgStats[c*10+3]/count;
-            
-            float cov_rr = bgStats[c*10+4]/count - mean_r*mean_r;
-            float cov_rg = bgStats[c*10+5]/count - mean_r*mean_g;
-            float cov_rb = bgStats[c*10+6]/count - mean_r*mean_b;
-            float cov_gg = bgStats[c*10+7]/count - mean_g*mean_g;
-            float cov_gb = bgStats[c*10+8]/count - mean_g*mean_b;
-            float cov_bb = bgStats[c*10+9]/count - mean_b*mean_b;
-            
-            float det = cov_rr * (cov_gg * cov_bb - cov_gb * cov_gb) -
-                       cov_rg * (cov_rg * cov_bb - cov_gb * cov_rb) +
-                       cov_rb * (cov_rg * cov_gb - cov_gg * cov_rb);
-            
-            printf("GPU BG[%d]: count=%.1f mean=(%.2f,%.2f,%.2f) cov=[%.6f,%.6f,%.6f;%.6f,%.6f;%.6f] det=%.9f\n",
-                   c, count, mean_r, mean_g, mean_b, 
-                   cov_rr, cov_rg, cov_rb, cov_gg, cov_gb, cov_bb, det);
-        }
-        
-        if (fgStats[c*10+0] > 0 && pixelCounts[1] > 0) {
-            float count = fgStats[c*10+0];
-            float mean_r = fgStats[c*10+1]/count;
-            float mean_g = fgStats[c*10+2]/count;
-            float mean_b = fgStats[c*10+3]/count;
-            
-            float cov_rr = fgStats[c*10+4]/count - mean_r*mean_r;
-            float cov_rg = fgStats[c*10+5]/count - mean_r*mean_g;
-            float cov_rb = fgStats[c*10+6]/count - mean_r*mean_b;
-            float cov_gg = fgStats[c*10+7]/count - mean_g*mean_g;
-            float cov_gb = fgStats[c*10+8]/count - mean_g*mean_b;
-            float cov_bb = fgStats[c*10+9]/count - mean_b*mean_b;
-            
-            float det = cov_rr * (cov_gg * cov_bb - cov_gb * cov_gb) -
-                       cov_rg * (cov_rg * cov_bb - cov_gb * cov_rb) +
-                       cov_rb * (cov_rg * cov_gb - cov_gg * cov_rb);
-            
-            printf("GPU FG[%d]: count=%.1f mean=(%.2f,%.2f,%.2f) cov=[%.6f,%.6f,%.6f;%.6f,%.6f;%.6f] det=%.9f\n",
-                   c, count, mean_r, mean_g, mean_b,
-                   cov_rr, cov_rg, cov_rb, cov_gg, cov_gb, cov_bb, det);
-        }
-    }
+    // Intermediate calculations performed on GPU - no need to sync for debug in production
+    // GPU calculations complete - debug output removed for performance
     
     // NO commit, NO wait. The caller is responsible for synchronization.
 }

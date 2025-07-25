@@ -569,9 +569,8 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         // Existing implementation: download GPU data → CPU max-flow → upload mask
         // ---------------------------------------------------------------------------------
 
-        // PHASE 2: Single synchronization point - only when CPU needs GPU data
-        // This is the ONLY place we should synchronize in the entire iteration
-        stream.syncCPU();
+        // PHASE 2: Let downloads handle synchronization automatically
+        // First download will sync if commands are queued, subsequent downloads will be fast
 
         // PHASE 3: CPU-bound operations (these don't use streams since they're CPU-only)
         // Construct graph and solve min-cut max-flow on CPU
