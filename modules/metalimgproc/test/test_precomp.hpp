@@ -9,6 +9,11 @@
 
 #ifdef HAVE_METAL
 
+// Internal headers for testing - only include in Objective-C++ files
+#ifdef __OBJC__
+#include "../src/graphcut_internal.hpp"
+#endif
+
 // Additional test utilities
 #include <chrono>
 

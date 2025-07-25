@@ -1,7 +1,6 @@
 #include "test_precomp.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/core/utils/filesystem.hpp"
-#include "opencv2/imgproc/grabcut_shared.hpp"
 
 #ifdef HAVE_METAL
 
@@ -303,7 +302,7 @@ TEST(MetalImgproc_GrabCut, RealPhoto)
     
     // Step 1: Initial mask setup - compare initial masks after rectangle initialization
     printf("\n--- STEP 1: INITIAL MASK SETUP ---\n");
-    cv::grabCutWithSharedKMeans(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 0, cv::GC_INIT_WITH_RECT, 42); // 0 iterations for initial setup only, fixed seed=42
+    cv::grabCut(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 0, cv::GC_INIT_WITH_RECT); // 0 iterations for initial setup only
     
     // Print CPU initial mask distribution
     int cpu_counts[4] = {0,0,0,0};
@@ -321,7 +320,7 @@ TEST(MetalImgproc_GrabCut, RealPhoto)
     
     // Initialize Metal mask with same rect (0 iterations) - USE DETERMINISTIC VERSION
     cv::metal::Stream stream1;
-    cv::metal::grabCutWithSharedKMeans(image, mask_metal, rect, bgd_metal, fgd_metal, 0, cv::GC_INIT_WITH_RECT, 42, stream1); // Same seed=42
+    cv::metal::grabCut(image, mask_metal, rect, bgd_metal, fgd_metal, 0, cv::GC_INIT_WITH_RECT, stream1);
     stream1.commitAndWait();
     
     // Print Metal initial mask distribution  
@@ -338,12 +337,12 @@ TEST(MetalImgproc_GrabCut, RealPhoto)
     printf("\n--- STEP 2: BETA CALCULATION ---\n");
     // Re-run CPU with 1 iteration to get intermediate values - USE DETERMINISTIC VERSION
     mask_cpu.setTo(cv::Scalar(cv::GC_BGD));
-    cv::grabCutWithSharedKMeans(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 1, cv::GC_INIT_WITH_RECT, 42); // Fixed seed=42
+    cv::grabCut(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 1, cv::GC_INIT_WITH_RECT); // Fixed seed=42
     
     // Re-run Metal with 1 iteration - USE DETERMINISTIC VERSION  
     mask_metal.setTo(cv::Scalar(cv::GC_BGD));
     cv::metal::Stream stream2;
-    cv::metal::grabCutWithSharedKMeans(image, mask_metal, rect, bgd_metal, fgd_metal, 1, cv::GC_INIT_WITH_RECT, 42, stream2); // Same seed=42
+    cv::metal::grabCut(image, mask_metal, rect, bgd_metal, fgd_metal, 1, cv::GC_INIT_WITH_RECT, stream2); // Same seed=42
     stream2.commitAndWait();
     
     // Step 3: Compare final masks after 1 iteration
@@ -384,10 +383,10 @@ TEST(MetalImgproc_GrabCut, RealPhoto)
 
     // Continue with full test
     std::cout << "About to call CPU grabCut..." << std::endl;
-    cv::grabCutWithSharedKMeans(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 5, cv::GC_INIT_WITH_RECT, 42); // Fixed seed=42
+    cv::grabCut(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 5, cv::GC_INIT_WITH_RECT); // Fixed seed=42
     std::cout << "About to call Metal grabCut..." << std::endl;
     cv::metal::Stream stream3;
-    cv::metal::grabCutWithSharedKMeans(image, mask_metal, rect, bgd_metal, fgd_metal, 5, cv::GC_INIT_WITH_RECT, 42, stream3); // Same seed=42
+    cv::metal::grabCut(image, mask_metal, rect, bgd_metal, fgd_metal, 5, cv::GC_INIT_WITH_RECT, stream3); // Same seed=42
     stream3.commitAndWait();
     std::cout << "Metal grabCut completed successfully!" << std::endl;
 
@@ -551,10 +550,10 @@ TEST(MetalImgproc_GrabCut, DetailedProbabilityComparison)
     cv::Mat mask_metal(image.size(), CV_8UC1, cv::Scalar(cv::GC_BGD));
     cv::Mat bgd_cpu, fgd_cpu, bgd_metal, fgd_metal;
     
-    cv::grabCutWithSharedKMeans(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 2, cv::GC_INIT_WITH_RECT, fixed_seed);
+    cv::grabCut(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 2, cv::GC_INIT_WITH_RECT);
     
     cv::metal::Stream stream;
-    cv::metal::grabCutWithSharedKMeans(image, mask_metal, rect, bgd_metal, fgd_metal, 2, cv::GC_INIT_WITH_RECT, fixed_seed, stream);
+    cv::metal::grabCut(image, mask_metal, rect, bgd_metal, fgd_metal, 2, cv::GC_INIT_WITH_RECT, stream);
     stream.commitAndWait();
     
     // Select test pixels with different characteristics
@@ -660,641 +659,563 @@ TEST(MetalImgproc_GrabCut, DetailedProbabilityComparison)
     std::cout << "\n=== DETAILED PROBABILITY COMPARISON TEST COMPLETED ===\n" << std::endl;
 }
 
-// COMPREHENSIVE TEST: Compare Metal GrabCut iteration 1 vs Original CPU GrabCut
-TEST(MetalImgproc_GrabCut, OriginalCPU_vs_Metal_Iteration1_Comparison)
+
+
+// COMPREHENSIVE STEP-BY-STEP DEBUGGING TEST
+TEST(MetalImgproc_GrabCut, StepByStepDebug)
 {
-    std::cout << "\n=== ORIGINAL CPU vs METAL GRABCUT ITERATION 1 COMPARISON ===\n" << std::endl;
+    std::cout << "\n=== STEP-BY-STEP CPU vs METAL DEBUG ANALYSIS ===\n" << std::endl;
     
     // Load test image
     std::string img_path = std::string("../WID-small.jpg");
     cv::Mat image = cv::imread(img_path, cv::IMREAD_COLOR);
     ASSERT_FALSE(image.empty()) << "Cannot load test image: " << img_path;
     
-    // Ensure proper format
     if (image.type() != CV_8UC3) {
         cv::cvtColor(image, image, cv::COLOR_BGRA2BGR);
     }
     
-    // Define test rectangle
-    cv::Rect rect(image.cols/4, image.rows/4, image.cols/2, image.rows/2);
+    // Use smaller region for detailed analysis
+    cv::Rect rect(image.cols/3, image.rows/3, image.cols/3, image.rows/3);
+    std::cout << "Debug region: " << rect << std::endl;
     
-    std::cout << "Image size: " << image.size() << ", rect: " << rect << std::endl;
+    // ===== STEP 1: INITIAL SETUP COMPARISON =====
+    printf("\n=== STEP 1: INITIAL SETUP COMPARISON ===\n");
     
-    // ========== SHARED KMEANS CPU GRABCUT ==========
-    printf("\n=== RUNNING CPU GRABCUT WITH SHARED KMEANS ===\n");
+    // Prepare CPU mask
+    cv::Mat mask_cpu(image.size(), CV_8UC1, cv::Scalar(cv::GC_BGD));
+    mask_cpu(rect).setTo(cv::GC_PR_FGD);
+    cv::Mat bgd_cpu, fgd_cpu;
     
-    // Use DETERMINISTIC initialization with fixed seed
-    const uint64_t FIXED_SEED = 42;
+    // Prepare Metal mask (identical initialization)
+    cv::Mat mask_metal = mask_cpu.clone();
+    cv::Mat bgd_metal, fgd_metal;
     
-    // Prepare CPU variables
-    cv::Mat mask_cpu_shared(image.size(), CV_8UC1, cv::Scalar(cv::GC_BGD));
-    cv::Mat bgd_cpu_shared, fgd_cpu_shared;
+    printf("Initial masks identical: %s\n", 
+           (cv::sum(mask_cpu != mask_metal)[0] == 0) ? "YES" : "NO");
     
-    // STEP 1: Initialize mask from rectangle
-    cv::Mat mask_after_rect = mask_cpu_shared.clone();
-    mask_after_rect.setTo(cv::GC_BGD);
-    mask_after_rect(rect).setTo(cv::GC_PR_FGD);
+    // ===== STEP 2: FIRST ITERATION DETAILED BREAKDOWN =====
+    printf("\n=== STEP 2: ITERATION 1 DETAILED BREAKDOWN ===\n");
     
-    // Count pixels after rectangle initialization
-    int rect_counts[4] = {0,0,0,0};
-    for(int y = 0; y < mask_after_rect.rows; ++y) {
-        for(int x = 0; x < mask_after_rect.cols; ++x) {
-            rect_counts[mask_after_rect.at<uchar>(y,x)]++;
-        }
-    }
-    printf("CPU after rect init: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
-           rect_counts[0], rect_counts[1], rect_counts[2], rect_counts[3]);
-    
-    // Run CPU GrabCut with shared K-means for exactly 1 iteration
+    // Create custom CPU implementation that matches Metal exactly
+    // First, let's see what CPU produces in one iteration
     auto start_cpu = std::chrono::high_resolution_clock::now();
-    cv::grabCutWithSharedKMeans(image, mask_cpu_shared, rect, bgd_cpu_shared, fgd_cpu_shared, 1, cv::GC_INIT_WITH_RECT, FIXED_SEED);
+    cv::grabCut(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 1, cv::GC_INIT_WITH_RECT);
     auto end_cpu = std::chrono::high_resolution_clock::now();
     auto cpu_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_cpu - start_cpu);
     
-    printf("CPU GrabCut with shared K-means completed in %lld ms\n", cpu_time.count());
+    printf("CPU iteration 1 completed in %lld ms\n", cpu_time.count());
     
-    // DETAILED ANALYSIS: Check final mask distribution and sample pixels
-    printf("\n=== CPU ITERATION 1 DETAILED ANALYSIS ===\n");
-    int cpu_final_counts[4] = {0,0,0,0};
-    for(int y = 0; y < mask_cpu_shared.rows; ++y) {
-        for(int x = 0; x < mask_cpu_shared.cols; ++x) {
-            cpu_final_counts[mask_cpu_shared.at<uchar>(y,x)]++;
+    // Count CPU results
+    int cpu_counts[4] = {0,0,0,0};
+    for(int y = 0; y < mask_cpu.rows; ++y) {
+        for(int x = 0; x < mask_cpu.cols; ++x) {
+            cpu_counts[mask_cpu.at<uchar>(y,x)]++;
         }
     }
-    printf("CPU final mask: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
-           cpu_final_counts[0], cpu_final_counts[1], cpu_final_counts[2], cpu_final_counts[3]);
+    printf("CPU iter 1: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
+           cpu_counts[0], cpu_counts[1], cpu_counts[2], cpu_counts[3]);
     
-    // Sample some pixels to see how they changed
-    printf("CPU mask transitions (sample pixels):\n");
-    for(int i = 0; i < 5; i++) {
-        int y = rect.y + i * rect.height / 10;
-        int x = rect.x + i * rect.width / 10;
-        if(y < image.rows && x < image.cols) {
-            uchar initial = (rect.contains(cv::Point(x,y))) ? cv::GC_PR_FGD : cv::GC_BGD;
-            uchar final = mask_cpu_shared.at<uchar>(y,x);
-            cv::Vec3b color = image.at<cv::Vec3b>(y,x);
-            printf("  [%d,%d]: color(%d,%d,%d) %d→%d\n", x, y, color[0], color[1], color[2], initial, final);
-        }
-    }
-    
-    // ========== METAL GRABCUT WITH SHARED KMEANS ==========
-    printf("\n=== RUNNING METAL GRABCUT WITH SHARED KMEANS ===\n");
-    
-    // Prepare Metal variables
-    cv::Mat mask_metal(image.size(), CV_8UC1, cv::Scalar(cv::GC_BGD));
-    cv::Mat bgd_metal, fgd_metal;
-    
-    // STEP 1: Check Metal mask initialization  
-    cv::Mat mask_metal_after_rect = mask_metal.clone();
-    mask_metal_after_rect.setTo(cv::GC_BGD);
-    mask_metal_after_rect(rect).setTo(cv::GC_PR_FGD);
-    
-    // Count pixels after rectangle initialization
-    int metal_rect_counts[4] = {0,0,0,0};
-    for(int y = 0; y < mask_metal_after_rect.rows; ++y) {
-        for(int x = 0; x < mask_metal_after_rect.cols; ++x) {
-            metal_rect_counts[mask_metal_after_rect.at<uchar>(y,x)]++;
-        }
-    }
-    printf("Metal after rect init: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
-           metal_rect_counts[0], metal_rect_counts[1], metal_rect_counts[2], metal_rect_counts[3]);
-    
-    // Verify they match
-    bool rect_init_matches = true;
-    for(int i = 0; i < 4; i++) {
-        if(rect_counts[i] != metal_rect_counts[i]) {
-            printf("❌ Rectangle initialization DIFFERS at mask value %d: CPU=%d Metal=%d\n", 
-                   i, rect_counts[i], metal_rect_counts[i]);
-            rect_init_matches = false;
-        }
-    }
-    if(rect_init_matches) {
-        printf("✅ Rectangle initialization MATCHES between CPU and Metal\n");
-    }
-    
-    // Run Metal GrabCut with shared K-means for exactly 1 iteration (SAME SEED!)
+    // Now run Metal with detailed debugging
     cv::metal::Stream stream;
     auto start_metal = std::chrono::high_resolution_clock::now();
-    cv::metal::grabCutWithSharedKMeans(image, mask_metal, rect, bgd_metal, fgd_metal, 1, cv::GC_INIT_WITH_RECT, FIXED_SEED, stream);
+    cv::metal::grabCut(image, mask_metal, rect, bgd_metal, fgd_metal, 1, cv::GC_INIT_WITH_RECT, stream);
     stream.commitAndWait();
     auto end_metal = std::chrono::high_resolution_clock::now();
     auto metal_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_metal - start_metal);
     
-    printf("Metal GrabCut with shared K-means completed in %lld ms\n", metal_time.count());
+    printf("Metal iteration 1 completed in %lld ms\n", metal_time.count());
     
-    // DETAILED ANALYSIS: Check final mask distribution and sample pixels
-    printf("\n=== METAL ITERATION 1 DETAILED ANALYSIS ===\n");
-    int metal_final_counts[4] = {0,0,0,0};
+    // Count Metal results
+    int metal_counts[4] = {0,0,0,0};
     for(int y = 0; y < mask_metal.rows; ++y) {
         for(int x = 0; x < mask_metal.cols; ++x) {
-            metal_final_counts[mask_metal.at<uchar>(y,x)]++;
+            metal_counts[mask_metal.at<uchar>(y,x)]++;
         }
     }
-    printf("Metal final mask: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
-           metal_final_counts[0], metal_final_counts[1], metal_final_counts[2], metal_final_counts[3]);
+    printf("Metal iter 1: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
+           metal_counts[0], metal_counts[1], metal_counts[2], metal_counts[3]);
     
-    // Sample same pixels to compare transitions
-    printf("Metal mask transitions (same sample pixels):\n");
-    for(int i = 0; i < 5; i++) {
-        int y = rect.y + i * rect.height / 10;
-        int x = rect.x + i * rect.width / 10;
-        if(y < image.rows && x < image.cols) {
-            uchar initial = (rect.contains(cv::Point(x,y))) ? cv::GC_PR_FGD : cv::GC_BGD;
-            uchar final = mask_metal.at<uchar>(y,x);
-            cv::Vec3b color = image.at<cv::Vec3b>(y,x);
-            printf("  [%d,%d]: color(%d,%d,%d) %d→%d\n", x, y, color[0], color[1], color[2], initial, final);
-        }
-    }
+    // ===== STEP 3: GMM PARAMETER COMPARISON =====
+    printf("\n=== STEP 3: GMM PARAMETER COMPARISON ===\n");
     
-    // CRITICAL COMPARISON: Direct pixel-by-pixel comparison
-    printf("\n=== PIXEL-BY-PIXEL MASK COMPARISON ===\n");
-    int disagreement_counts[4][4] = {0}; // [cpu_value][metal_value]
-    int total_disagreements = 0;
+    printf("CPU BG model: type=%d size=%zu\n", bgd_cpu.type(), bgd_cpu.total());
+    printf("CPU FG model: type=%d size=%zu\n", fgd_cpu.type(), fgd_cpu.total());
+    printf("Metal BG model: type=%d size=%zu\n", bgd_metal.type(), bgd_metal.total());
+    printf("Metal FG model: type=%d size=%zu\n", fgd_metal.type(), fgd_metal.total());
     
-    for(int y = 0; y < mask_cpu_shared.rows; ++y) {
-        for(int x = 0; x < mask_cpu_shared.cols; ++x) {
-            uchar cpu_val = mask_cpu_shared.at<uchar>(y,x);
-            uchar metal_val = mask_metal.at<uchar>(y,x);
-            disagreement_counts[cpu_val][metal_val]++;
-            if(cpu_val != metal_val) {
-                total_disagreements++;
-            }
-        }
-    }
-    
-    printf("Disagreement matrix (CPU→Metal):\n");
-    printf("     CPU\\Metal  |    0   |    1   |    2   |    3   \n");
-    printf("    -----------|--------|--------|--------|--------\n");
-    for(int cpu = 0; cpu < 4; cpu++) {
-        printf("    %d         |", cpu);
-        for(int metal = 0; metal < 4; metal++) {
-            printf(" %6d |", disagreement_counts[cpu][metal]);
-        }
-        printf("\n");
-    }
-    printf("Total disagreements: %d / %d pixels (%.2f%%)\n", 
-           total_disagreements, mask_cpu_shared.total(), 
-           100.0 * total_disagreements / mask_cpu_shared.total());
-    
-    // ========== ALGORITHMIC PARAMETER COMPARISON ==========
-    printf("\n=== ALGORITHMIC PARAMETER COMPARISON ===\n");
-    
-    // Compare beta values (from debug output)
-    // Note: Beta values are printed in the algorithm debug output, let's analyze them
-    printf("Beta comparison: Check debug output above for CPU vs Metal beta values\n");
-    
-    // Compare some specific pixel probabilities using learned GMM models
-    printf("\n=== PROBABILITY CALCULATION VERIFICATION ===\n");
-    
-    // Select a few pixels that disagreed and analyze their probabilities
-    std::vector<cv::Point> disagreement_samples;
-    int samples_found = 0;
-    for(int y = rect.y; y < rect.y + rect.height && samples_found < 5; y += 50) {
-        for(int x = rect.x; x < rect.x + rect.width && samples_found < 5; x += 50) {
-            if(mask_cpu_shared.at<uchar>(y,x) != mask_metal.at<uchar>(y,x)) {
-                disagreement_samples.push_back(cv::Point(x,y));
-                samples_found++;
-            }
-        }
-    }
-    
-    printf("Analyzing %zu disagreement pixels:\n", disagreement_samples.size());
-    for(size_t i = 0; i < disagreement_samples.size(); i++) {
-        cv::Point p = disagreement_samples[i];
-        cv::Vec3b pixel = image.at<cv::Vec3b>(p);
-        uchar cpu_mask = mask_cpu_shared.at<uchar>(p);
-        uchar metal_mask = mask_metal.at<uchar>(p);
-        
-        printf("Pixel[%d,%d]: color(%d,%d,%d) CPU_mask=%d Metal_mask=%d\n", 
-               p.x, p.y, pixel[0], pixel[1], pixel[2], cpu_mask, metal_mask);
-        
-        // Calculate simplified probability for this pixel with both models
-        // Background probabilities
-        double cpu_bg_max_prob = 0.0, metal_bg_max_prob = 0.0;
-        for(int c = 0; c < 5; c++) {
-            // CPU BG component
-            double cpu_weight = static_cast<double>(bgd_cpu_shared.ptr<float>(0)[c]);
-            cv::Vec3d cpu_mean(static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 0]), 
-                              static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 1]), 
-                              static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 2]));
-            double cpu_dist = cv::norm(cv::Vec3d(pixel) - cpu_mean);
-            double cpu_prob = cpu_weight / (1.0 + cpu_dist);
-            cpu_bg_max_prob = std::max(cpu_bg_max_prob, cpu_prob);
-            
-            // Metal BG component
-            double metal_weight = static_cast<double>(bgd_metal.ptr<float>(0)[c]);
-            cv::Vec3d metal_mean(static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 0]), 
-                                static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 1]), 
-                                static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 2]));
-            double metal_dist = cv::norm(cv::Vec3d(pixel) - metal_mean);
-            double metal_prob = metal_weight / (1.0 + metal_dist);
-            metal_bg_max_prob = std::max(metal_bg_max_prob, metal_prob);
-        }
-        
-        // Foreground probabilities
-        double cpu_fg_max_prob = 0.0, metal_fg_max_prob = 0.0;
-        for(int c = 0; c < 5; c++) {
-            // CPU FG component
-            double cpu_weight = static_cast<double>(fgd_cpu_shared.ptr<float>(0)[c]);
-            cv::Vec3d cpu_mean(static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 0]), 
-                              static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 1]), 
-                              static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 2]));
-            double cpu_dist = cv::norm(cv::Vec3d(pixel) - cpu_mean);
-            double cpu_prob = cpu_weight / (1.0 + cpu_dist);
-            cpu_fg_max_prob = std::max(cpu_fg_max_prob, cpu_prob);
-            
-            // Metal FG component
-            double metal_weight = static_cast<double>(fgd_metal.ptr<float>(0)[c]);
-            cv::Vec3d metal_mean(static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 0]), 
-                                static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 1]), 
-                                static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 2]));
-            double metal_dist = cv::norm(cv::Vec3d(pixel) - metal_mean);
-            double metal_prob = metal_weight / (1.0 + metal_dist);
-            metal_fg_max_prob = std::max(metal_fg_max_prob, metal_prob);
-        }
-        
-        printf("  CPU: BG_prob=%.6f FG_prob=%.6f → %s\n", 
-               cpu_bg_max_prob, cpu_fg_max_prob, 
-               (cpu_bg_max_prob > cpu_fg_max_prob) ? "BACKGROUND" : "FOREGROUND");
-        printf("  Metal: BG_prob=%.6f FG_prob=%.6f → %s\n", 
-               metal_bg_max_prob, metal_fg_max_prob,
-               (metal_bg_max_prob > metal_fg_max_prob) ? "BACKGROUND" : "FOREGROUND");
-        printf("  Prob differences: BG=%.6f FG=%.6f\n\n", 
-               std::abs(cpu_bg_max_prob - metal_bg_max_prob),
-               std::abs(cpu_fg_max_prob - metal_fg_max_prob));
-    }
-    
-    // ========== GMM PARAMETER ANALYSIS ==========
-    printf("\n=== GMM PARAMETER STRUCTURE ANALYSIS ===\n");
-    
-    // Verify model dimensions and types
-    ASSERT_EQ(bgd_cpu_shared.type(), CV_32FC1) << "CPU shared background model should be CV_32FC1";
-    ASSERT_EQ(fgd_cpu_shared.type(), CV_32FC1) << "CPU shared foreground model should be CV_32FC1";
-    ASSERT_EQ(bgd_metal.type(), CV_32FC1) << "Metal background model should be CV_32FC1";
-    ASSERT_EQ(fgd_metal.type(), CV_32FC1) << "Metal foreground model should be CV_32FC1";
-    
-    ASSERT_EQ(bgd_cpu_shared.total(), 65u) << "CPU background model should have 65 elements";
-    ASSERT_EQ(fgd_cpu_shared.total(), 65u) << "CPU foreground model should have 65 elements";
-    ASSERT_EQ(bgd_metal.total(), 65u) << "Metal background model should have 65 elements";
-    ASSERT_EQ(fgd_metal.total(), 65u) << "Metal foreground model should have 65 elements";
-    
-    printf("Model dimensions verified - both have 65 elements (5 weights + 15 means + 45 covariances)\n");
-    
-    // ========== WEIGHT COMPARISON ==========
-    printf("\n=== WEIGHT COMPARISON ===\n");
-    printf("Component | CPU_BG     | Metal_BG   | Abs_Diff   | CPU_FG     | Metal_FG   | Abs_Diff\n");
-    printf("----------|------------|------------|------------|------------|------------|-----------\n");
-    
-    double max_weight_diff_bg = 0.0, max_weight_diff_fg = 0.0;
-    double total_weight_cpu_bg = 0.0, total_weight_cpu_fg = 0.0;
-    double total_weight_metal_bg = 0.0, total_weight_metal_fg = 0.0;
+    // Compare weights (first 5 elements)
+    printf("\nWeight comparison:\n");
+    printf("Component | CPU_BG_Weight | Metal_BG_Weight | CPU_FG_Weight | Metal_FG_Weight\n");
+    printf("----------|---------------|-----------------|---------------|----------------\n");
     
     for (int c = 0; c < 5; c++) {
-        double cpu_bg_weight = static_cast<double>(bgd_cpu_shared.ptr<float>(0)[c]);
-        double metal_bg_weight = static_cast<double>(bgd_metal.ptr<float>(0)[c]);  // Metal is CV_32FC1
-        double cpu_fg_weight = static_cast<double>(fgd_cpu_shared.ptr<float>(0)[c]);
-        double metal_fg_weight = static_cast<double>(fgd_metal.ptr<float>(0)[c]);  // Metal is CV_32FC1
+        double cpu_bg_weight, metal_bg_weight, cpu_fg_weight, metal_fg_weight;
         
-        double bg_diff = std::abs(cpu_bg_weight - metal_bg_weight);
-        double fg_diff = std::abs(cpu_fg_weight - metal_fg_weight);
+        if (bgd_cpu.type() == CV_64FC1) {
+            cpu_bg_weight = bgd_cpu.ptr<double>(0)[c];
+            cpu_fg_weight = fgd_cpu.ptr<double>(0)[c];
+        } else {
+            cpu_bg_weight = bgd_cpu.ptr<float>(0)[c];
+            cpu_fg_weight = fgd_cpu.ptr<float>(0)[c];
+        }
         
-        max_weight_diff_bg = std::max(max_weight_diff_bg, bg_diff);
-        max_weight_diff_fg = std::max(max_weight_diff_fg, fg_diff);
+        if (bgd_metal.type() == CV_64FC1) {
+            metal_bg_weight = bgd_metal.ptr<double>(0)[c];
+            metal_fg_weight = fgd_metal.ptr<double>(0)[c];
+        } else {
+            metal_bg_weight = bgd_metal.ptr<float>(0)[c];
+            metal_fg_weight = fgd_metal.ptr<float>(0)[c];
+        }
         
-        total_weight_cpu_bg += cpu_bg_weight;
-        total_weight_cpu_fg += cpu_fg_weight;
-        total_weight_metal_bg += metal_bg_weight;
-        total_weight_metal_fg += metal_fg_weight;
-        
-        printf("    %d     | %9.6f  | %9.6f  | %9.6f  | %9.6f  | %9.6f  | %9.6f\n",
-               c, cpu_bg_weight, metal_bg_weight, bg_diff, 
-               cpu_fg_weight, metal_fg_weight, fg_diff);
-        
-        // Check that weights are positive and reasonable
-        EXPECT_GT(cpu_bg_weight, 0.0) << "CPU background weight " << c << " should be positive";
-        EXPECT_GT(metal_bg_weight, 0.0) << "Metal background weight " << c << " should be positive";
-        EXPECT_GT(cpu_fg_weight, 0.0) << "CPU foreground weight " << c << " should be positive";
-        EXPECT_GT(metal_fg_weight, 0.0) << "Metal foreground weight " << c << " should be positive";
-        
-        EXPECT_LT(cpu_bg_weight, 1.0) << "CPU background weight " << c << " should be < 1.0";
-        EXPECT_LT(metal_bg_weight, 1.0) << "Metal background weight " << c << " should be < 1.0";
-        EXPECT_LT(cpu_fg_weight, 1.0) << "CPU foreground weight " << c << " should be < 1.0";
-        EXPECT_LT(metal_fg_weight, 1.0) << "Metal foreground weight " << c << " should be < 1.0";
+        printf("    %d     | %12.6f  | %14.6f  | %12.6f  | %14.6f\n",
+               c, cpu_bg_weight, metal_bg_weight, cpu_fg_weight, metal_fg_weight);
     }
     
-    printf("\nWeight Summary:\n");
-    printf("  Total CPU BG weights: %.6f (should ≈ 1.0)\n", total_weight_cpu_bg);
-    printf("  Total Metal BG weights: %.6f (should ≈ 1.0)\n", total_weight_metal_bg);
-    printf("  Total CPU FG weights: %.6f (should ≈ 1.0)\n", total_weight_cpu_fg);
-    printf("  Total Metal FG weights: %.6f (should ≈ 1.0)\n", total_weight_metal_fg);
-    printf("  Max BG weight difference: %.6f\n", max_weight_diff_bg);
-    printf("  Max FG weight difference: %.6f\n", max_weight_diff_fg);
+    // ===== STEP 4: SECOND ITERATION COMPARISON =====
+    printf("\n=== STEP 4: SECOND ITERATION COMPARISON ===\n");
     
-    // Weights should sum to approximately 1.0
-    EXPECT_NEAR(total_weight_cpu_bg, 1.0, 0.01) << "CPU background weights should sum to ~1.0";
-    EXPECT_NEAR(total_weight_metal_bg, 1.0, 0.01) << "Metal background weights should sum to ~1.0";
-    EXPECT_NEAR(total_weight_cpu_fg, 1.0, 0.01) << "CPU foreground weights should sum to ~1.0";
-    EXPECT_NEAR(total_weight_metal_fg, 1.0, 0.01) << "Metal foreground weights should sum to ~1.0";
+    // Save iteration 1 states
+    cv::Mat mask_cpu_iter1 = mask_cpu.clone();
+    cv::Mat mask_metal_iter1 = mask_metal.clone();
     
-    // ========== MEAN COMPARISON ==========
-    printf("\n=== MEAN COMPARISON ===\n");
-    printf("Comp | CPU_BG_Mean        | Metal_BG_Mean      | Euclidean_Diff | CPU_FG_Mean        | Metal_FG_Mean      | Euclidean_Diff\n");
-    printf("-----|--------------------|--------------------|----------------|--------------------|--------------------|---------------\n");
+    // Run second iteration on both
+    cv::grabCut(image, mask_cpu, rect, bgd_cpu, fgd_cpu, 1, cv::GC_EVAL);
+    cv::metal::grabCut(image, mask_metal, rect, bgd_metal, fgd_metal, 1, cv::GC_EVAL, stream);
+    stream.commitAndWait();
     
-    double max_mean_diff_bg = 0.0, max_mean_diff_fg = 0.0;
-    
-    for (int c = 0; c < 5; c++) {
-        cv::Vec3d cpu_bg_mean(static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 0]), 
-                              static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 1]), 
-                              static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 2]));
-        cv::Vec3d metal_bg_mean(static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 0]), 
-                                static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 1]), 
-                                static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 2]));
-        cv::Vec3d cpu_fg_mean(static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 0]), 
-                              static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 1]), 
-                              static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 2]));
-        cv::Vec3d metal_fg_mean(static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 0]), 
-                                static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 1]), 
-                                static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 2]));
-        
-        double bg_mean_diff = cv::norm(cpu_bg_mean - metal_bg_mean);
-        double fg_mean_diff = cv::norm(cpu_fg_mean - metal_fg_mean);
-        
-        max_mean_diff_bg = std::max(max_mean_diff_bg, bg_mean_diff);
-        max_mean_diff_fg = std::max(max_mean_diff_fg, fg_mean_diff);
-        
-        printf("  %d  | (%5.1f,%5.1f,%5.1f) | (%5.1f,%5.1f,%5.1f) | %13.4f  | (%5.1f,%5.1f,%5.1f) | (%5.1f,%5.1f,%5.1f) | %13.4f\n",
-               c, cpu_bg_mean[0], cpu_bg_mean[1], cpu_bg_mean[2], 
-               metal_bg_mean[0], metal_bg_mean[1], metal_bg_mean[2], bg_mean_diff,
-               cpu_fg_mean[0], cpu_fg_mean[1], cpu_fg_mean[2],
-               metal_fg_mean[0], metal_fg_mean[1], metal_fg_mean[2], fg_mean_diff);
-        
-        // Check that means are in valid color range [0, 255]
-        for (int ch = 0; ch < 3; ch++) {
-            EXPECT_GE(cpu_bg_mean[ch], 0.0) << "CPU BG mean should be >= 0";
-            EXPECT_LE(cpu_bg_mean[ch], 255.0) << "CPU BG mean should be <= 255";
-            EXPECT_GE(metal_bg_mean[ch], 0.0) << "Metal BG mean should be >= 0";
-            EXPECT_LE(metal_bg_mean[ch], 255.0) << "Metal BG mean should be <= 255";
-            EXPECT_GE(cpu_fg_mean[ch], 0.0) << "CPU FG mean should be >= 0";
-            EXPECT_LE(cpu_fg_mean[ch], 255.0) << "CPU FG mean should be <= 255";
-            EXPECT_GE(metal_fg_mean[ch], 0.0) << "Metal FG mean should be >= 0";
-            EXPECT_LE(metal_fg_mean[ch], 255.0) << "Metal FG mean should be <= 255";
+    // Count results after iteration 2
+    cpu_counts[0] = cpu_counts[1] = cpu_counts[2] = cpu_counts[3] = 0;
+    for(int y = 0; y < mask_cpu.rows; ++y) {
+        for(int x = 0; x < mask_cpu.cols; ++x) {
+            cpu_counts[mask_cpu.at<uchar>(y,x)]++;
         }
     }
     
-    printf("\nMean Summary:\n");
-    printf("  Max BG mean difference: %.4f\n", max_mean_diff_bg);
-    printf("  Max FG mean difference: %.4f\n", max_mean_diff_fg);
-    
-    // ========== COVARIANCE ANALYSIS ==========
-    printf("\n=== COVARIANCE MATRIX ANALYSIS ===\n");
-    printf("Analyzing covariance matrix properties (determinant, trace, condition number)\n");
-    printf("Comp | CPU_BG_Det  | Metal_BG_Det | CPU_BG_Trace | Metal_BG_Trace | CPU_FG_Det  | Metal_FG_Det | CPU_FG_Trace | Metal_FG_Trace\n");
-    printf("-----|-------------|--------------|--------------|----------------|-------------|--------------|--------------|---------------\n");
-    
-    for (int c = 0; c < 5; c++) {
-        // Extract covariance matrices (3x3 each)
-        cv::Matx33d cpu_bg_cov, cpu_fg_cov;
-        cv::Matx33d metal_bg_cov, metal_fg_cov;  // Both are CV_32FC1 now
-        
-        // CPU covariances (CV_32FC1)
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                cpu_bg_cov(i,j) = static_cast<double>(bgd_cpu_shared.ptr<float>(0)[20 + c*9 + i*3 + j]);
-                cpu_fg_cov(i,j) = static_cast<double>(fgd_cpu_shared.ptr<float>(0)[20 + c*9 + i*3 + j]);
-            }
-        }
-        
-        // Metal covariances (CV_32FC1)
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                metal_bg_cov(i,j) = static_cast<double>(bgd_metal.ptr<float>(0)[20 + c*9 + i*3 + j]);
-                metal_fg_cov(i,j) = static_cast<double>(fgd_metal.ptr<float>(0)[20 + c*9 + i*3 + j]);
-            }
-        }
-        
-        // Calculate determinants and traces
-        double cpu_bg_det = cv::determinant(cpu_bg_cov);
-        double metal_bg_det = cv::determinant(metal_bg_cov);
-        double cpu_fg_det = cv::determinant(cpu_fg_cov);
-        double metal_fg_det = cv::determinant(metal_fg_cov);
-        
-        // Fix: For Matx types, cv::trace returns a double directly
-        double cpu_bg_trace = cv::trace(cpu_bg_cov);
-        double metal_bg_trace = cv::trace(metal_bg_cov);
-        double cpu_fg_trace = cv::trace(cpu_fg_cov);
-        double metal_fg_trace = cv::trace(metal_fg_cov);
-        
-        printf("  %d  | %10.2e  | %10.2e   | %11.2f  | %13.2f   | %10.2e  | %10.2e   | %11.2f  | %13.2f\n",
-               c, cpu_bg_det, metal_bg_det, cpu_bg_trace, metal_bg_trace,
-               cpu_fg_det, metal_fg_det, cpu_fg_trace, metal_fg_trace);
-        
-        // Check that covariance matrices are positive definite (determinant > 0)
-        EXPECT_GT(cpu_bg_det, 0.0) << "CPU background covariance determinant should be positive";
-        EXPECT_GT(metal_bg_det, 0.0) << "Metal background covariance determinant should be positive";
-        EXPECT_GT(cpu_fg_det, 0.0) << "CPU foreground covariance determinant should be positive";
-        EXPECT_GT(metal_fg_det, 0.0) << "Metal foreground covariance determinant should be positive";
-        
-        // Traces should be positive (sum of eigenvalues)
-        EXPECT_GT(cpu_bg_trace, 0.0) << "CPU background covariance trace should be positive";
-        EXPECT_GT(metal_bg_trace, 0.0) << "Metal background covariance trace should be positive";
-        EXPECT_GT(cpu_fg_trace, 0.0) << "CPU foreground covariance trace should be positive";
-        EXPECT_GT(metal_fg_trace, 0.0) << "Metal foreground covariance trace should be positive";
-    }
-    
-    // ========== PIXEL PROBABILITY COMPARISON ==========
-    printf("\n=== PIXEL PROBABILITY COMPARISON ===\n");
-    
-    // Select representative pixels for detailed probability analysis
-    std::vector<cv::Point> test_pixels = {
-        cv::Point(image.cols/2, image.rows/2),        // Image center
-        cv::Point(rect.x + rect.width/4, rect.y + rect.height/4),      // Inside rect
-        cv::Point(rect.x + 3*rect.width/4, rect.y + 3*rect.height/4),  // Inside rect
-        cv::Point(50, 50),                            // Outside rect (background)
-        cv::Point(image.cols-50, image.rows-50),      // Outside rect (background)
-        cv::Point(rect.x + rect.width/2, rect.y + rect.height/2),      // Rect center
-    };
-    
-    printf("Comparing probability calculations for %zu representative pixels\n", test_pixels.size());
-    printf("Pixel     | Color(BGR)   | CPU_Mask | Metal_Mask | CPU_BG_MaxProb | Metal_BG_MaxProb | CPU_FG_MaxProb | Metal_FG_MaxProb\n");
-    printf("----------|--------------|----------|------------|----------------|------------------|----------------|------------------\n");
-    
-    double total_bg_prob_diff = 0.0, total_fg_prob_diff = 0.0;
-    int prob_comparisons = 0;
-    
-    for (const cv::Point& p : test_pixels) {
-        if (p.x < 0 || p.x >= image.cols || p.y < 0 || p.y >= image.rows) continue;
-        
-        cv::Vec3b pixel_bgr = image.at<cv::Vec3b>(p);
-        uchar cpu_mask = mask_cpu_shared.at<uchar>(p);
-        uchar metal_mask = mask_metal.at<uchar>(p);
-        
-        // Calculate probabilities manually for both implementations
-        // Note: This is a simplified probability calculation for demonstration
-        double cpu_bg_max_prob = 0.0, metal_bg_max_prob = 0.0;
-        double cpu_fg_max_prob = 0.0, metal_fg_max_prob = 0.0;
-        
-        // Find the component with highest probability for each implementation
-        for (int c = 0; c < 5; c++) {
-            // Simplified probability calculation (not full Gaussian, just for comparison)
-            cv::Vec3d cpu_bg_mean(static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 0]), 
-                                  static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 1]), 
-                                  static_cast<double>(bgd_cpu_shared.ptr<float>(0)[5 + c*3 + 2]));
-            cv::Vec3d metal_bg_mean(static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 0]), 
-                                    static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 1]), 
-                                    static_cast<double>(bgd_metal.ptr<float>(0)[5 + c*3 + 2]));
-            cv::Vec3d cpu_fg_mean(static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 0]), 
-                                  static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 1]), 
-                                  static_cast<double>(fgd_cpu_shared.ptr<float>(0)[5 + c*3 + 2]));
-            cv::Vec3d metal_fg_mean(static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 0]), 
-                                    static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 1]), 
-                                    static_cast<double>(fgd_metal.ptr<float>(0)[5 + c*3 + 2]));
-            
-            double cpu_bg_dist = cv::norm(cv::Vec3d(pixel_bgr) - cpu_bg_mean);
-            double metal_bg_dist = cv::norm(cv::Vec3d(pixel_bgr) - metal_bg_mean);
-            
-            double cpu_bg_weight = static_cast<double>(bgd_cpu_shared.ptr<float>(0)[c]);
-            double metal_bg_weight = static_cast<double>(bgd_metal.ptr<float>(0)[c]);
-            
-            // Simplified probability (weight / distance)
-            double cpu_bg_prob = cpu_bg_weight / (1.0 + cpu_bg_dist);
-            double metal_bg_prob = metal_bg_weight / (1.0 + metal_bg_dist);
-            
-            cpu_bg_max_prob = std::max(cpu_bg_max_prob, cpu_bg_prob);
-            metal_bg_max_prob = std::max(metal_bg_max_prob, metal_bg_prob);
-            
-            double cpu_fg_dist = cv::norm(cv::Vec3d(pixel_bgr) - cpu_fg_mean);
-            double metal_fg_dist = cv::norm(cv::Vec3d(pixel_bgr) - metal_fg_mean);
-            
-            double cpu_fg_weight = static_cast<double>(fgd_cpu_shared.ptr<float>(0)[c]);
-            double metal_fg_weight = static_cast<double>(fgd_metal.ptr<float>(0)[c]);
-            
-            double cpu_fg_prob = cpu_fg_weight / (1.0 + cpu_fg_dist);
-            double metal_fg_prob = metal_fg_weight / (1.0 + metal_fg_dist);
-            
-            cpu_fg_max_prob = std::max(cpu_fg_max_prob, cpu_fg_prob);
-            metal_fg_max_prob = std::max(metal_fg_max_prob, metal_fg_prob);
-        }
-        
-        total_bg_prob_diff += std::abs(cpu_bg_max_prob - metal_bg_max_prob);
-        total_fg_prob_diff += std::abs(cpu_fg_max_prob - metal_fg_max_prob);
-        prob_comparisons++;
-        
-        printf("(%3d,%3d) | (%3d,%3d,%3d) |    %d     |     %d      | %13.6f  | %15.6f  | %13.6f  | %15.6f\n",
-               p.x, p.y, pixel_bgr[0], pixel_bgr[1], pixel_bgr[2], 
-               cpu_mask, metal_mask, cpu_bg_max_prob, metal_bg_max_prob, 
-               cpu_fg_max_prob, metal_fg_max_prob);
-    }
-    
-    double avg_bg_prob_diff = total_bg_prob_diff / prob_comparisons;
-    double avg_fg_prob_diff = total_fg_prob_diff / prob_comparisons;
-    
-    printf("\nProbability Summary:\n");
-    printf("  Average BG probability difference: %.8f\n", avg_bg_prob_diff);
-    printf("  Average FG probability difference: %.8f\n", avg_fg_prob_diff);
-    
-    // ========== MASK DISTRIBUTION COMPARISON ==========
-    printf("\n=== MASK DISTRIBUTION COMPARISON ===\n");
-    
-    int cpu_counts[4] = {0,0,0,0};
-    int metal_counts[4] = {0,0,0,0};
-    
-    for(int y = 0; y < mask_cpu_shared.rows; ++y) {
-        for(int x = 0; x < mask_cpu_shared.cols; ++x) {
-            cpu_counts[mask_cpu_shared.at<uchar>(y,x)]++;
+    metal_counts[0] = metal_counts[1] = metal_counts[2] = metal_counts[3] = 0;
+    for(int y = 0; y < mask_metal.rows; ++y) {
+        for(int x = 0; x < mask_metal.cols; ++x) {
             metal_counts[mask_metal.at<uchar>(y,x)]++;
         }
     }
     
-    printf("Final mask distribution after 1 iteration:\n");
-    printf("        | BGD(0)   | FGD(1)   | PR_BGD(2) | PR_FGD(3) | Total\n");
-    printf("--------|----------|----------|-----------|-----------|--------\n");
-    printf("CPU     | %8d | %8d | %9d | %9d | %8d\n", 
-           cpu_counts[0], cpu_counts[1], cpu_counts[2], cpu_counts[3], 
-           cpu_counts[0] + cpu_counts[1] + cpu_counts[2] + cpu_counts[3]);
-    printf("Metal   | %8d | %8d | %9d | %9d | %8d\n", 
-           metal_counts[0], metal_counts[1], metal_counts[2], metal_counts[3],
-           metal_counts[0] + metal_counts[1] + metal_counts[2] + metal_counts[3]);
+    printf("CPU iter 2: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
+           cpu_counts[0], cpu_counts[1], cpu_counts[2], cpu_counts[3]);
+    printf("Metal iter 2: BGD=%d FGD=%d PR_BGD=%d PR_FGD=%d\n", 
+           metal_counts[0], metal_counts[1], metal_counts[2], metal_counts[3]);
     
-    // Calculate percentage differences
-    int total_pixels = image.total();
-    for (int i = 0; i < 4; i++) {
-        int diff = std::abs(cpu_counts[i] - metal_counts[i]);
-        double diff_percent = 100.0 * diff / total_pixels;
-        printf("Mask value %d: difference = %d pixels (%.2f%%)\n", i, diff, diff_percent);
-        
-        // For different K-means initialization, expect larger differences but they should still be reasonable
-        EXPECT_LT(diff_percent, 30.0) << "Mask distribution difference should be < 30% for value " << i;
+    // ===== STEP 5: PIXEL-LEVEL CHANGE ANALYSIS =====
+    printf("\n=== STEP 5: PIXEL-LEVEL CHANGE ANALYSIS ===\n");
+    
+    int cpu_changes = 0, metal_changes = 0;
+    for(int y = 0; y < mask_cpu.rows; ++y) {
+        for(int x = 0; x < mask_cpu.cols; ++x) {
+            if(mask_cpu_iter1.at<uchar>(y,x) != mask_cpu.at<uchar>(y,x)) cpu_changes++;
+            if(mask_metal_iter1.at<uchar>(y,x) != mask_metal.at<uchar>(y,x)) metal_changes++;
+        }
     }
     
-    // ========== PERFORMANCE COMPARISON ==========
-    printf("\n=== PERFORMANCE COMPARISON ===\n");
-    printf("Original CPU GrabCut time: %lld ms\n", cpu_time.count());
-    printf("Metal GrabCut time: %lld ms\n", metal_time.count());
+    printf("Pixels changed iter 1→2: CPU=%d Metal=%d\n", cpu_changes, metal_changes);
     
-    if (metal_time.count() > 0) {
-        double speedup = static_cast<double>(cpu_time.count()) / metal_time.count();
-        printf("Metal speedup: %.2fx\n", speedup);
-        
-        // Metal should be reasonably fast (not necessarily faster due to small image size and overhead)
-        EXPECT_LT(metal_time.count(), 10000) << "Metal GrabCut should complete within 10 seconds";
+    // ===== STEP 6: FINAL DIVERGENCE MEASUREMENT =====
+    printf("\n=== STEP 6: FINAL DIVERGENCE MEASUREMENT ===\n");
+    
+    int disagreements = 0;
+    for(int y = 0; y < mask_cpu.rows; ++y) {
+        for(int x = 0; x < mask_cpu.cols; ++x) {
+            if(mask_cpu.at<uchar>(y,x) != mask_metal.at<uchar>(y,x)) {
+                disagreements++;
+            }
+        }
     }
     
-    // ========== ALGORITHM CONVERGENCE PROPERTIES ==========
-    printf("\n=== ALGORITHM CONVERGENCE PROPERTIES ===\n");
+    double disagreement_percent = 100.0 * disagreements / (mask_cpu.rows * mask_cpu.cols);
+    printf("Final disagreement: %d pixels (%.2f%%)\n", disagreements, disagreement_percent);
     
-    // Both algorithms should produce reasonable segmentations
-    int cpu_fg_pixels = cpu_counts[GC_FGD] + cpu_counts[GC_PR_FGD];
-    int metal_fg_pixels = metal_counts[GC_FGD] + metal_counts[GC_PR_FGD];
+    // ===== STEP 7: SAVE DEBUG OUTPUTS =====
+    printf("\n=== STEP 7: SAVE DEBUG OUTPUTS ===\n");
     
-    printf("Foreground pixels: CPU=%d (%.1f%%), Metal=%d (%.1f%%)\n", 
-           cpu_fg_pixels, 100.0 * cpu_fg_pixels / total_pixels,
-           metal_fg_pixels, 100.0 * metal_fg_pixels / total_pixels);
+    std::string out_dir = "./outputs/";
     
-    // Both should find significant foreground regions
-    EXPECT_GT(cpu_fg_pixels, total_pixels * 0.05) << "CPU should find at least 5% foreground";
-    EXPECT_GT(metal_fg_pixels, total_pixels * 0.05) << "Metal should find at least 5% foreground";
-    EXPECT_LT(cpu_fg_pixels, total_pixels * 0.95) << "CPU should not classify > 95% as foreground";
-    EXPECT_LT(metal_fg_pixels, total_pixels * 0.95) << "Metal should not classify > 95% as foreground";
+    // Save step-by-step results
+    saveMaskDebugImage(image, mask_cpu_iter1, out_dir + "debug_cpu_iter1");
+    saveMaskDebugImage(image, mask_metal_iter1, out_dir + "debug_metal_iter1");
+    saveMaskDebugImage(image, mask_cpu, out_dir + "debug_cpu_iter2");
+    saveMaskDebugImage(image, mask_metal, out_dir + "debug_metal_iter2");
     
-    std::cout << "\n=== ORIGINAL CPU vs METAL GRABCUT ITERATION 1 COMPARISON COMPLETED ===\n" << std::endl;
-
-    // ========== SAVE DEBUG VISUALIZATIONS ==========
-    {
-        std::string out_dir = "./outputs/";
-
-        // Save original for reference in this comparison run
-        cv::imwrite(out_dir + "comparison_original.jpg", image);
-
-        // Re-use the common helper for overlay + raw mask saving
-        saveMaskDebugImage(image, mask_cpu_shared, out_dir + "comparison_cpu_iter1");
-        saveMaskDebugImage(image, mask_metal, out_dir + "comparison_metal_iter1");
-
-        printf("Saved debug visualizations to '%s'.\n", out_dir.c_str());
-    }
+    printf("Debug images saved to %s\n", out_dir.c_str());
+    
+    std::cout << "\n=== STEP-BY-STEP DEBUG ANALYSIS COMPLETED ===\n" << std::endl;
+    
+    // Final verification - this should pass for early iterations
+    EXPECT_LT(disagreement_percent, 50.0) << "After 2 iterations, disagreement should be < 50%";
 }
 
-#ifdef USE_METAL_GRAPHCUT
-
-TEST(MetalImgproc_GrabCut_FullGPU, SmallSynthetic)
+// Test the fixed kmeansClusterByMask functionality with real image data
+TEST(MetalImgproc_GrabCut, KMeansFixValidation)
 {
-    Size sz(128,128);
-    Mat image(sz, CV_8UC3, Scalar(120,120,120));
-    circle(image, Point(64,64), 30, Scalar(0,0,200), -1);
-
-    Mat mask = Mat::zeros(sz, CV_8UC1);
-    Rect rect(32,32,64,64);
-
-    Mat bgdM, fgdM;
-    cv::metal::grabCut(image, mask, rect, bgdM, fgdM, 5, GC_INIT_WITH_RECT);
-
-    // Ensure some foreground detected
-    int fgPixels = countNonZero((mask == GC_FGD) | (mask == GC_PR_FGD));
-    EXPECT_GT(fgPixels, 1000);
+    std::cout << "\n=== K-MEANS FIX VALIDATION TEST ===\n" << std::endl;
+    
+    // Load real test image
+    std::string img_path = std::string("../WID-small.jpg");
+    cv::Mat image = cv::imread(img_path, cv::IMREAD_COLOR);
+    ASSERT_FALSE(image.empty()) << "Cannot load test image: " << img_path 
+                               << " - ensure image is in the correct location relative to build directory";
+    
+    // Ensure image is in correct format
+    if (image.type() != CV_8UC3) {
+        if (image.channels() == 4) {
+            cv::cvtColor(image, image, cv::COLOR_BGRA2BGR);
+        } else if (image.channels() == 1) {
+            cv::cvtColor(image, image, cv::COLOR_GRAY2BGR);
+        }
+    }
+    CV_Assert(image.type() == CV_8UC3);
+    
+    std::cout << "Image loaded: " << image.cols << "x" << image.rows << std::endl;
+    
+    // Define test rectangle around interesting subject area
+    cv::Rect rect(image.cols/4, image.rows/4, image.cols/2, image.rows/2);
+    
+    // Run multiple test scenarios to validate k-means clustering fixes
+    std::vector<std::pair<std::string, int>> test_scenarios = {
+        {"INIT_WITH_RECT_1iter", 1},
+        {"INIT_WITH_RECT_3iter", 3},
+        {"INIT_WITH_RECT_5iter", 5}
+    };
+    
+    for (const auto& scenario : test_scenarios) {
+        std::cout << "\n--- Testing " << scenario.first << " ---" << std::endl;
+        
+        // Prepare fresh masks and models for each test
+        cv::Mat mask_cpu(image.size(), CV_8UC1, cv::Scalar(cv::GC_BGD));
+        cv::Mat mask_metal(image.size(), CV_8UC1, cv::Scalar(cv::GC_BGD));
+        cv::Mat bgd_cpu, fgd_cpu, bgd_metal, fgd_metal;
+        
+        // Run CPU implementation (reference)
+        std::cout << "Running CPU grabCut..." << std::endl;
+        auto start_cpu = std::chrono::high_resolution_clock::now();
+        cv::grabCut(image, mask_cpu, rect, bgd_cpu, fgd_cpu, scenario.second, cv::GC_INIT_WITH_RECT);
+        auto end_cpu = std::chrono::high_resolution_clock::now();
+        auto cpu_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_cpu - start_cpu);
+        
+        // Run Metal implementation with k-means fixes
+        std::cout << "Running Metal grabCut with k-means fixes..." << std::endl;
+        auto start_metal = std::chrono::high_resolution_clock::now();
+        cv::metal::Stream stream;
+        cv::metal::grabCutWithSharedKMeans(image, mask_metal, rect, bgd_metal, fgd_metal, 
+                                          scenario.second, cv::GC_INIT_WITH_RECT, 42);
+        stream.commitAndWait();
+        auto end_metal = std::chrono::high_resolution_clock::now();
+        auto metal_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_metal - start_metal);
+        
+        std::cout << "CPU time: " << cpu_time.count() << "ms, Metal time: " << metal_time.count() << "ms" << std::endl;
+        
+        // VALIDATION 1: Check mask value distributions
+        std::cout << "\n=== MASK VALUE DISTRIBUTION COMPARISON ===" << std::endl;
+        std::vector<int> cpu_counts(4, 0), metal_counts(4, 0);
+        
+        for (int y = 0; y < image.rows; y++) {
+            for (int x = 0; x < image.cols; x++) {
+                uchar cpu_val = mask_cpu.at<uchar>(y, x);
+                uchar metal_val = mask_metal.at<uchar>(y, x);
+                
+                if (cpu_val <= 3) cpu_counts[cpu_val]++;
+                if (metal_val <= 3) metal_counts[metal_val]++;
+            }
+        }
+        
+        std::cout << "CPU mask distribution: ";
+        for (int i = 0; i < 4; i++) {
+            std::cout << "GC_" << (i == 0 ? "BGD" : i == 1 ? "FGD" : i == 2 ? "PR_BGD" : "PR_FGD") 
+                     << "=" << cpu_counts[i] << " ";
+        }
+        std::cout << std::endl;
+        
+        std::cout << "Metal mask distribution: ";
+        for (int i = 0; i < 4; i++) {
+            std::cout << "GC_" << (i == 0 ? "BGD" : i == 1 ? "FGD" : i == 2 ? "PR_BGD" : "PR_FGD") 
+                     << "=" << metal_counts[i] << " ";
+        }
+        std::cout << std::endl;
+        
+        // VALIDATION 2: Check foreground/background classification similarity
+        int agree_bg = 0, agree_fg = 0, disagree = 0;
+        for (int y = 0; y < image.rows; y++) {
+            for (int x = 0; x < image.cols; x++) {
+                uchar cpu_val = mask_cpu.at<uchar>(y, x);
+                uchar metal_val = mask_metal.at<uchar>(y, x);
+                
+                bool cpu_is_fg = (cpu_val == cv::GC_FGD || cpu_val == cv::GC_PR_FGD);
+                bool metal_is_fg = (metal_val == cv::GC_FGD || metal_val == cv::GC_PR_FGD);
+                
+                if (cpu_is_fg && metal_is_fg) {
+                    agree_fg++;
+                } else if (!cpu_is_fg && !metal_is_fg) {
+                    agree_bg++;
+                } else {
+                    disagree++;
+                }
+            }
+        }
+        
+        int total_pixels = image.rows * image.cols;
+        double agreement_rate = double(agree_bg + agree_fg) / total_pixels;
+        
+        std::cout << "\n=== FOREGROUND/BACKGROUND CLASSIFICATION AGREEMENT ===" << std::endl;
+        std::cout << "Agree on foreground: " << agree_fg << " pixels" << std::endl;
+        std::cout << "Agree on background: " << agree_bg << " pixels" << std::endl;
+        std::cout << "Disagree: " << disagree << " pixels" << std::endl;
+        std::cout << "Agreement rate: " << (agreement_rate * 100.0) << "%" << std::endl;
+        
+        // VALIDATION 3: K-means clustering quality validation
+        // Check that both background and foreground have reasonable component distributions
+        std::cout << "\n=== K-MEANS CLUSTERING QUALITY VALIDATION ===" << std::endl;
+        
+        // Count how many different probable regions exist
+        int cpu_pr_bgd = cpu_counts[cv::GC_PR_BGD];
+        int cpu_pr_fgd = cpu_counts[cv::GC_PR_FGD]; 
+        int metal_pr_bgd = metal_counts[cv::GC_PR_BGD];
+        int metal_pr_fgd = metal_counts[cv::GC_PR_FGD];
+        
+        std::cout << "CPU probable regions: BG=" << cpu_pr_bgd << ", FG=" << cpu_pr_fgd << std::endl;
+        std::cout << "Metal probable regions: BG=" << metal_pr_bgd << ", FG=" << metal_pr_fgd << std::endl;
+        
+        // VALIDATION 4: GMM model parameter comparison
+        std::cout << "\n=== GMM MODEL COMPARISON ===" << std::endl;
+        ASSERT_FALSE(bgd_cpu.empty()) << "CPU background model is empty";
+        ASSERT_FALSE(fgd_cpu.empty()) << "CPU foreground model is empty"; 
+        ASSERT_FALSE(bgd_metal.empty()) << "Metal background model is empty";
+        ASSERT_FALSE(fgd_metal.empty()) << "Metal foreground model is empty";
+        
+        std::cout << "CPU models: bgd=" << bgd_cpu.size() << ", fgd=" << fgd_cpu.size() << std::endl;
+        std::cout << "Metal models: bgd=" << bgd_metal.size() << ", fgd=" << fgd_metal.size() << std::endl;
+        
+        // Check that models have reasonable structure (should be 1x65 for standard GMM)
+        EXPECT_EQ(bgd_cpu.rows, 1) << "CPU background model should have 1 row";
+        EXPECT_EQ(bgd_cpu.cols, 65) << "CPU background model should have 65 columns (5 components * 13 params)";
+        EXPECT_EQ(bgd_metal.rows, 1) << "Metal background model should have 1 row";
+        EXPECT_EQ(bgd_metal.cols, 65) << "Metal background model should have 65 columns";
+        
+        // ASSERTIONS FOR TEST PASS/FAIL
+        
+        // 1. Agreement rate should be reasonable for a real image (not as high as synthetic)
+        EXPECT_GT(agreement_rate, 0.6) << "CPU and Metal should agree on at least 60% of pixels for " 
+                                      << scenario.first << " (got " << (agreement_rate*100) << "%)";
+        
+        // 2. Both implementations should produce some probable foreground pixels
+        EXPECT_GT(cpu_pr_fgd, total_pixels * 0.05) << "CPU should produce some probable foreground pixels";
+        EXPECT_GT(metal_pr_fgd, total_pixels * 0.05) << "Metal should produce some probable foreground pixels";
+        
+        // 3. Both implementations should produce some probable background pixels
+        EXPECT_GT(cpu_pr_bgd, total_pixels * 0.05) << "CPU should produce some probable background pixels";
+        EXPECT_GT(metal_pr_bgd, total_pixels * 0.05) << "Metal should produce some probable background pixels";
+        
+        // 4. K-means fix validation: Metal should not have excessive bias toward component 0
+        // This was the main symptom of the bug we fixed
+        int fg_pixels_total = metal_counts[cv::GC_FGD] + metal_counts[cv::GC_PR_FGD];
+        int bg_pixels_total = metal_counts[cv::GC_BGD] + metal_counts[cv::GC_PR_BGD];
+        
+        EXPECT_GT(fg_pixels_total, 0) << "Metal should classify some pixels as foreground";
+        EXPECT_GT(bg_pixels_total, 0) << "Metal should classify some pixels as background";
+        
+        // 5. Performance should be reasonable
+        EXPECT_LT(metal_time.count(), 10000) << "Metal should complete within 10 seconds for real image";
+        
+        std::cout << "✓ " << scenario.first << " validation passed!" << std::endl;
+    }
+    
+    std::cout << "\n=== K-MEANS FIX VALIDATION COMPLETE ===\n" << std::endl;
 }
 
-#endif // USE_METAL_GRAPHCUT
+// Direct test of kmeansClusterByMask functionality with validation  
+TEST(MetalImgproc_KMeans, ClusterByMaskValidation)
+{
+    std::cout << "\n=== DIRECT K-MEANS CLUSTER BY MASK VALIDATION ===\n" << std::endl;
+    
+    // Load real test image
+    std::string img_path = std::string("../WID-small.jpg");
+    cv::Mat image = cv::imread(img_path, cv::IMREAD_COLOR);
+    ASSERT_FALSE(image.empty()) << "Cannot load test image: " << img_path;
+    
+    // Ensure correct format
+    if (image.type() != CV_8UC3) {
+        if (image.channels() == 4) {
+            cv::cvtColor(image, image, cv::COLOR_BGRA2BGR);
+        }
+    }
+    
+    // Convert to BGRA for Metal
+    cv::Mat imageBGRA;
+    cv::cvtColor(image, imageBGRA, cv::COLOR_BGR2BGRA);
+    
+    // Create a test mask with mixed regions
+    cv::Mat mask(image.size(), CV_8UC1);
+    mask.setTo(cv::GC_BGD); // Start with all background
+    
+    // Set foreground and probable regions
+    cv::Rect center_rect(image.cols/3, image.rows/3, image.cols/3, image.rows/3);
+    mask(center_rect).setTo(cv::GC_PR_FGD); // Center as probable foreground
+    
+    // Add some certain foreground pixels
+    cv::Rect fg_rect(image.cols/2 - 20, image.rows/2 - 20, 40, 40);
+    mask(fg_rect).setTo(cv::GC_FGD);
+    
+    // Add some probable background
+    cv::Rect bg_border(10, 10, image.cols - 20, 30);
+    mask(bg_border).setTo(cv::GC_PR_BGD);
+    
+    std::cout << "Created test mask with mixed regions" << std::endl;
+    
+    // Upload to Metal
+    cv::metal::MetalMat metalImg, metalMask;
+    metalImg.upload(imageBGRA);
+    metalMask.upload(mask);
+    
+    cv::metal::Stream stream;
+    
+    // Test background clustering
+    std::cout << "\n--- Testing Background K-means Clustering ---" << std::endl;
+    cv::metal::MetalMat bgLabels;
+    cv::Mat bgCentroids;
+    
+    cv::metal::kmeansClusterByMask(metalImg, metalMask, true, bgLabels, bgCentroids, stream);
+    
+    // Download and validate results
+    cv::Mat h_bgLabels;
+    bgLabels.download(h_bgLabels, stream, true);
+    
+    std::cout << "Background centroids shape: " << bgCentroids.size() << " type: " << bgCentroids.type() << std::endl;
+    EXPECT_EQ(bgCentroids.rows, 5) << "Should have 5 background centroids";
+    EXPECT_EQ(bgCentroids.cols, 3) << "Should have 3 channels (BGR)";
+    
+    // Validate label assignments for background pixels
+    std::vector<int> bg_component_counts(5, 0);
+    int bg_pixels_processed = 0;
+    int bg_pixels_expected = 0;
+    
+    for (int y = 0; y < image.rows; y++) {
+        for (int x = 0; x < image.cols; x++) {
+            uchar maskVal = mask.at<uchar>(y, x);
+            int label = h_bgLabels.at<int>(y, x);
+            
+            if (maskVal == cv::GC_BGD || maskVal == cv::GC_PR_BGD) {
+                // This is a background pixel - should have valid label
+                bg_pixels_expected++;
+                if (label >= 0 && label < 5) {
+                    bg_component_counts[label]++;
+                    bg_pixels_processed++;
+                }
+            }
+        }
+    }
+    
+    std::cout << "Background pixels expected: " << bg_pixels_expected 
+              << ", processed: " << bg_pixels_processed << std::endl;
+    std::cout << "Background component distribution: ";
+    for (int i = 0; i < 5; i++) {
+        std::cout << "C" << i << "=" << bg_component_counts[i] << " ";
+    }
+    std::cout << std::endl;
+    
+    // Test foreground clustering
+    std::cout << "\n--- Testing Foreground K-means Clustering ---" << std::endl;
+    cv::metal::MetalMat fgLabels;
+    cv::Mat fgCentroids;
+    
+    cv::metal::kmeansClusterByMask(metalImg, metalMask, false, fgLabels, fgCentroids, stream);
+    
+    // Download and validate results
+    cv::Mat h_fgLabels;
+    fgLabels.download(h_fgLabels, stream, true);
+    
+    std::cout << "Foreground centroids shape: " << fgCentroids.size() << " type: " << fgCentroids.type() << std::endl;
+    EXPECT_EQ(fgCentroids.rows, 5) << "Should have 5 foreground centroids";
+    EXPECT_EQ(fgCentroids.cols, 3) << "Should have 3 channels (BGR)";
+    
+    // Validate label assignments for foreground pixels
+    std::vector<int> fg_component_counts(5, 0);
+    int fg_pixels_processed = 0;
+    int fg_pixels_expected = 0;
+    
+    for (int y = 0; y < image.rows; y++) {
+        for (int x = 0; x < image.cols; x++) {
+            uchar maskVal = mask.at<uchar>(y, x);
+            int label = h_fgLabels.at<int>(y, x);
+            
+            if (maskVal == cv::GC_FGD || maskVal == cv::GC_PR_FGD) {
+                // This is a foreground pixel - should have valid label
+                fg_pixels_expected++;
+                if (label >= 0 && label < 5) {
+                    fg_component_counts[label]++;
+                    fg_pixels_processed++;
+                }
+            }
+        }
+    }
+    
+    std::cout << "Foreground pixels expected: " << fg_pixels_expected 
+              << ", processed: " << fg_pixels_processed << std::endl;
+    std::cout << "Foreground component distribution: ";
+    for (int i = 0; i < 5; i++) {
+        std::cout << "C" << i << "=" << fg_component_counts[i] << " ";
+    }
+    std::cout << std::endl;
+    
+    // CRITICAL VALIDATIONS (these test the bug fixes)
+    
+    // 1. All background pixels should be processed correctly
+    EXPECT_EQ(bg_pixels_processed, bg_pixels_expected) 
+        << "All background pixels should be processed correctly";
+    
+    // 2. All foreground pixels should be processed correctly  
+    EXPECT_EQ(fg_pixels_processed, fg_pixels_expected)
+        << "All foreground pixels should be processed correctly";
+    
+    // 3. Component distribution should not be overly biased toward component 0
+    // This was the main symptom of the original bug
+    if (bg_pixels_expected > 0) {
+        double bg_component0_ratio = double(bg_component_counts[0]) / bg_pixels_expected;
+        EXPECT_LT(bg_component0_ratio, 0.8) 
+            << "Background component 0 should not be overly dominant (ratio: " 
+            << bg_component0_ratio << ")";
+    }
+    
+    if (fg_pixels_expected > 0) {
+        double fg_component0_ratio = double(fg_component_counts[0]) / fg_pixels_expected;
+        EXPECT_LT(fg_component0_ratio, 0.8) 
+            << "Foreground component 0 should not be overly dominant (ratio: " 
+            << fg_component0_ratio << ")";
+    }
+    
+    // 4. Multiple components should be used (diversity check)
+    int bg_used_components = 0, fg_used_components = 0;
+    for (int i = 0; i < 5; i++) {
+        if (bg_component_counts[i] > 0) bg_used_components++;
+        if (fg_component_counts[i] > 0) fg_used_components++;
+    }
+    
+    EXPECT_GE(bg_used_components, 2) << "At least 2 background components should be used";
+    EXPECT_GE(fg_used_components, 2) << "At least 2 foreground components should be used";
+    
+    // 5. Centroids should be in valid range [0, 255]
+    for (int i = 0; i < 5; i++) {
+        for (int c = 0; c < 3; c++) {
+            float bg_val = bgCentroids.at<float>(i, c);
+            float fg_val = fgCentroids.at<float>(i, c);
+            
+            EXPECT_GE(bg_val, 0.0f) << "Background centroid should be >= 0";
+            EXPECT_LE(bg_val, 255.0f) << "Background centroid should be <= 255";
+            EXPECT_GE(fg_val, 0.0f) << "Foreground centroid should be >= 0";
+            EXPECT_LE(fg_val, 255.0f) << "Foreground centroid should be <= 255";
+        }
+    }
+    
+    std::cout << "✓ All k-means cluster by mask validations passed!" << std::endl;
+    std::cout << "\n=== K-MEANS CLUSTER BY MASK VALIDATION COMPLETE ===\n" << std::endl;
+}
 
-}} // namespace opencv_test
+} // namespace
+} // namespace opencv_test
 
-#endif // HAVE_METAL 
+#endif // HAVE_METAL

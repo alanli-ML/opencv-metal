@@ -80,6 +80,10 @@ private:
 
     id<MTLBuffer> m_excessFlag   = nil; // uint[1] flag for push-relabel convergence
 
+    // --- Atomics refactor buffers (slice 1) ---
+    id<MTLBuffer> m_nodeDataAtom   = nil; // NodeDataAtom array (atomic excess+label)
+    id<MTLBuffer> m_residualAtom   = nil; // Residual4Atom array (atomic neighbour caps)
+
     // Allocation helper
     void allocateGraphBuffers();
 

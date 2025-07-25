@@ -9,6 +9,54 @@
 #include <algorithm>
 #include "opencv2/core/hal/interface.h" // for CV_8UC1 definition
 
+// -------------------------------------------------------------------------
+// Common Metal helpers for upcoming atomic refactor (Slice 1)
+// -------------------------------------------------------------------------
+
+static const char* kGraphCutCommonSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+#ifndef GRAPHCUT_COMMON_GUARD
+#define GRAPHCUT_COMMON_GUARD
+
+struct NodeDataAtom {
+    atomic_uint excessBits; // float bits
+    atomic_int  label;
+};
+
+struct Residual4Atom {
+    atomic_uint leftBits;
+    atomic_uint tlBits;
+    atomic_uint topBits;
+    atomic_uint trBits;
+};
+
+struct TerminalFlow {
+    float to_source;
+    float to_sink;
+};
+
+inline float fload(const device atomic_uint* p) {
+    return as_type<float>(atomic_load_explicit(p, memory_order_relaxed));
+}
+
+inline void fstore(device atomic_uint* p, float v) {
+    atomic_store_explicit(p, as_type<uint>(v), memory_order_relaxed);
+}
+
+inline float fadd(device atomic_uint* p, float v) {
+    return as_type<float>(atomic_fetch_add_explicit(p, as_type<uint>(v), memory_order_relaxed));
+}
+
+inline float fsub(device atomic_uint* p, float v) {
+    return as_type<float>(atomic_fetch_sub_explicit(p, as_type<uint>(v), memory_order_relaxed));
+}
+
+#endif // GRAPHCUT_COMMON_GUARD
+
+)";
+
 namespace {
 
 // Minimal MSL kernel to derive a provisional segmentation by comparing unary
@@ -46,17 +94,12 @@ struct NodeData {
     int   label;
 };
 
-struct TerminalFlow {
-    float to_source;
-    float to_sink;
-};
-
 kernel void buildGraphKernel(texture2d<float, access::read> bgTerm [[texture(0)]],
                              texture2d<float, access::read> fgTerm [[texture(1)]],
-                             texture2d<float4, access::read> wLeft [[texture(2)]],
-                             texture2d<float4, access::read> wTL [[texture(3)]],
-                             texture2d<float4, access::read> wTop [[texture(4)]],
-                             texture2d<float4, access::read> wTR [[texture(5)]],
+                             texture2d<float, access::read> wLeft [[texture(2)]],
+                             texture2d<float, access::read> wTL [[texture(3)]],
+                             texture2d<float, access::read> wTop [[texture(4)]],
+                             texture2d<float, access::read> wTR [[texture(5)]],
                              device NodeData*       nodeBuf [[buffer(0)]],
                              device TerminalFlow*   termBuf [[buffer(1)]],
                              device float4*         resBuf  [[buffer(2)]],
@@ -87,13 +130,204 @@ kernel void buildGraphKernel(texture2d<float, access::read> bgTerm [[texture(0)]
 
 )";
 
+// Slice 2: Build graph into atomic buffers
+static const char* kGraphCutBuildAtomSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+// Bring in common helpers via include string concatenation
+
+kernel void buildGraphAtomKernel(texture2d<float, access::read> bgTerm [[texture(0)]],
+                                 texture2d<float, access::read> fgTerm [[texture(1)]],
+                                 texture2d<float, access::read> wLeft [[texture(2)]],
+                                 texture2d<float, access::read> wTL   [[texture(3)]],
+                                 texture2d<float, access::read> wTop  [[texture(4)]],
+                                 texture2d<float, access::read> wTR   [[texture(5)]],
+                                 device NodeDataAtom* nodeAtom [[buffer(0)]],
+                                 device TerminalFlow* termBuf  [[buffer(1)]],
+                                 device Residual4Atom* resAtom  [[buffer(2)]],
+                                 uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= bgTerm.get_width() || gid.y >= bgTerm.get_height()) return;
+
+    uint idx = gid.y * bgTerm.get_width() + gid.x;
+
+    float bg = bgTerm.read(gid).x;
+    float fg = fgTerm.read(gid).x;
+
+    fstore(&nodeAtom[idx].excessBits, bg - fg);
+    atomic_store_explicit(&nodeAtom[idx].label, 0, memory_order_relaxed);
+
+    fstore(&resAtom[idx].leftBits, wLeft.read(gid).x);
+    fstore(&resAtom[idx].tlBits,   wTL.read(gid).x);
+    fstore(&resAtom[idx].topBits,  wTop.read(gid).x);
+    fstore(&resAtom[idx].trBits,   wTR.read(gid).x);
+}
+
+)";
+
+// Slice 3: atomic BFS init kernel (sets label & frontier list)
+static const char* kGraphCutBFSInitAtomSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void bfsInitAtomKernel(const device NodeDataAtom* nodeBuf [[buffer(0)]],
+                              device atomic_uint* levelCount [[buffer(1)]],
+                              device uint*        levelList  [[buffer(2)]],
+                              constant uint&       totalNodes [[buffer(3)]],
+                              uint3 gid [[thread_position_in_grid]])
+{
+    uint idx = gid.x;
+    if (idx >= totalNodes) return;
+
+    int lbl = atomic_load_explicit(&nodeBuf[idx].label, memory_order_relaxed);
+    if (lbl == 1) // reachable from sink set earlier by float BFS (or placeholder)
+    {
+        uint pos = atomic_fetch_add_explicit(levelCount, 1u, memory_order_relaxed);
+        levelList[pos] = idx;
+    }
+}
+
+)";
+
+// Slice 4: atomic BFS traverse kernel
+static const char* kGraphCutBFSTraverseAtomSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void bfsTraverseAtomKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
+                                  const device Residual4Atom* resBuf [[buffer(1)]],
+                                  device uint* levelIn [[buffer(2)]],
+                                  constant uint& levelInCount [[buffer(3)]],
+                                  device atomic_uint* nextCount [[buffer(4)]],
+                                  device uint* levelOut [[buffer(5)]],
+                                  constant uint& width [[buffer(6)]],
+                                  uint3 gid [[thread_position_in_grid]])
+{
+    uint idxIn = gid.x;
+    if (idxIn >= levelInCount) return;
+    uint idx = levelIn[idxIn];
+
+    int myLabel = atomic_load_explicit(&nodeBuf[idx].label, memory_order_relaxed);
+
+    // Offsets for neighbours (left, tl, top, tr)
+    int2 offs[4] = { int2(-1,0), int2(-1,-1), int2(0,-1), int2(1,-1) };
+
+    uint x = idx % width;
+    uint y = idx / width;
+
+    for(uint k=0;k<4;++k){
+        int nx = int(x)+offs[k].x;
+        int ny = int(y)+offs[k].y;
+        if(nx<0 || ny<0) continue;
+        uint nIdx = ny*width + nx;
+
+        // Load residual capacity from idx to neighbour
+        float cap = 0.0f;
+        if(k==0) cap = fload(&resBuf[idx].leftBits);
+        else if(k==1) cap = fload(&resBuf[idx].tlBits);
+        else if(k==2) cap = fload(&resBuf[idx].topBits);
+        else cap = fload(&resBuf[idx].trBits);
+
+        if(cap>1e-6f){
+            int neighLabel = atomic_load_explicit(&nodeBuf[nIdx].label, memory_order_relaxed);
+            if(neighLabel==0){
+                // set label atomically
+                if(atomic_compare_exchange_weak_explicit(&nodeBuf[nIdx].label, &neighLabel, myLabel+1, memory_order_relaxed, memory_order_relaxed)){
+                    uint pos = atomic_fetch_add_explicit(nextCount,1u, memory_order_relaxed);
+                    levelOut[pos]=nIdx;
+                }
+            }
+        }
+    }
+}
+
+)";
+
+// Slice 5 - Push kernel (atomic)
+static const char* kGraphCutPushAtomSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void pushAtomKernel(device NodeDataAtom* nodeBuf     [[buffer(0)]],
+                          device Residual4Atom* resBuf    [[buffer(1)]],
+                          device uint*         activeList [[buffer(2)]],
+                          constant uint&       activeCount [[buffer(3)]],
+                          device atomic_uint*  nextCount  [[buffer(4)]],
+                          device uint*         nextList   [[buffer(5)]],
+                          device TerminalFlow* termBuf    [[buffer(6)]],
+                          device atomic_uint*  excessFlag [[buffer(7)]],
+                          uint tid [[thread_position_in_grid]])
+{
+    if (tid>=activeCount) return;
+    uint idx = activeList[tid];
+
+    float exc = fload(&nodeBuf[idx].excessBits);
+
+    const float EPS = 1e-3f;
+
+    if(exc > EPS){ // push to sink
+        float cap = termBuf[idx].to_sink;
+        float delta = (exc < cap) ? exc : cap;
+        if(delta>EPS){
+            exc = exc - delta;
+            termBuf[idx].to_sink = cap - delta;
+            fstore(&nodeBuf[idx].excessBits, exc);
+        }
+    } else if(exc < -EPS){ // pull from source (negative excess)
+        float need = -exc;
+        float cap = termBuf[idx].to_source;
+        float delta = (need < cap) ? need : cap;
+        if(delta>EPS){
+            exc = exc + delta;
+            termBuf[idx].to_source = cap - delta;
+            fstore(&nodeBuf[idx].excessBits, exc);
+        }
+    }
+
+    // if still active requeue
+    if(fabs(exc) > EPS){
+        uint pos = atomic_fetch_add_explicit(nextCount,1u, memory_order_relaxed);
+        nextList[pos] = idx;
+        atomic_store_explicit(excessFlag,1u,memory_order_relaxed);
+    }
+}
+)";
+
+// Slice 6 - simple relabel kernel: bump height of still active nodes
+static const char* kGraphCutRelabelAtomSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct NodeDataAtom { 
+    atomic_uint excessBits; 
+    atomic_int label; 
+};
+
+inline float fload(const device atomic_uint* p) {
+    return as_type<float>(atomic_load_explicit(p, memory_order_relaxed));
+}
+
+kernel void relabelAtomKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
+                              device uint* activeList      [[buffer(1)]],
+                              constant uint& activeCount   [[buffer(2)]],
+                              uint tid [[thread_position_in_grid]])
+{
+    if(tid>=activeCount) return;
+    uint idx = activeList[tid];
+    float exc = fload(&nodeBuf[idx].excessBits);
+    if(fabs(exc) > 1e-3f){
+        atomic_fetch_add_explicit(&nodeBuf[idx].label, 1, memory_order_relaxed);
+    }
+}
+)";
+
 // Kernel to initialize node labels and set excess based on terminal capacities
 static const char* kGraphCutBFSInitSrc = R"(
 #include <metal_stdlib>
 using namespace metal;
 
 struct NodeData { float excess; int label; };
-struct TerminalFlow { float to_source; float to_sink; };
 
 kernel void bfsInitKernel(device NodeData* nodeBuf [[buffer(0)]],
                           device TerminalFlow* termBuf [[buffer(1)]],
@@ -258,7 +492,8 @@ id<MTLComputePipelineState> MetalGraphCut::getBuildGraphPipeline()
     if (!s_pipeline)
     {
         MetalContext& ctx = MetalContext::getInstance();
-        id<MTLFunction> fn = ctx.getMetalFunction(kGraphCutBuildSrc, "buildGraphKernel");
+        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutBuildSrc;
+        id<MTLFunction> fn = ctx.getMetalFunction(src, "buildGraphKernel");
         if (!fn) return nil;
         NSError* err = nil;
         s_pipeline = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
@@ -268,13 +503,45 @@ id<MTLComputePipelineState> MetalGraphCut::getBuildGraphPipeline()
     return s_pipeline;
 }
 
+id<MTLComputePipelineState> getBuildGraphAtomPipeline()
+{
+    static id<MTLComputePipelineState> s_pipeline=nil;
+    if(!s_pipeline){
+        MetalContext& ctx=MetalContext::getInstance();
+        std::string src=std::string(kGraphCutCommonSrc)+kGraphCutBuildAtomSrc;
+        id<MTLFunction> fn=ctx.getMetalFunction(src,"buildGraphAtomKernel");
+        if(!fn) return nil; NSError* err=nil;
+        s_pipeline=[ctx.device newComputePipelineStateWithFunction:fn error:&err];
+        if(!s_pipeline||err) CV_Error(cv::Error::StsError,"Failed to create buildGraphAtom pipeline");
+    }
+    return s_pipeline;
+}
+
+id<MTLComputePipelineState> getPushAtomPipeline()
+{
+    static id<MTLComputePipelineState> s_pipe = nil;
+    if (!s_pipe)
+    {
+        MetalContext& ctx = MetalContext::getInstance();
+        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutPushAtomSrc;
+        id<MTLFunction> fn = ctx.getMetalFunction(src, "pushAtomKernel");
+        if (!fn) return nil;
+        NSError* err = nil;
+        s_pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+        if (!s_pipe || err)
+            CV_Error(cv::Error::StsError, "Failed to create pushAtom pipeline");
+    }
+    return s_pipe;
+}
+
 id<MTLComputePipelineState> MetalGraphCut::getBFSInitPipeline()
 {
     static id<MTLComputePipelineState> s_pipeline = nil;
     if (!s_pipeline)
     {
         MetalContext& ctx = MetalContext::getInstance();
-        id<MTLFunction> fn = ctx.getMetalFunction(kGraphCutBFSInitSrc, "bfsInitKernel");
+        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutBFSInitSrc;
+        id<MTLFunction> fn = ctx.getMetalFunction(src, "bfsInitKernel");
         if (!fn) return nil;
         NSError* err = nil;
         s_pipeline = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
@@ -282,6 +549,21 @@ id<MTLComputePipelineState> MetalGraphCut::getBFSInitPipeline()
             CV_Error(cv::Error::StsError, "Failed to create bfsInitKernel pipeline");
     }
     return s_pipeline;
+}
+
+id<MTLComputePipelineState> getBFSInitAtomPipeline()
+{
+    static id<MTLComputePipelineState> s_pipe=nil;
+    if(!s_pipe){
+        MetalContext& ctx = MetalContext::getInstance();
+        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutBFSInitAtomSrc;
+        id<MTLFunction> fn = ctx.getMetalFunction(src, "bfsInitAtomKernel");
+        if(!fn) return nil;
+        NSError* err = nil;
+        s_pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+        if(!s_pipe || err) CV_Error(cv::Error::StsError, "Failed to create bfsInitAtom pipeline");
+    }
+    return s_pipe;
 }
 
 id<MTLComputePipelineState> MetalGraphCut::getBFSTraversePipeline()
@@ -298,6 +580,25 @@ id<MTLComputePipelineState> MetalGraphCut::getBFSTraversePipeline()
             CV_Error(cv::Error::StsError, "Failed to create bfsTraverseKernel pipeline");
     }
     return s_pipeline;
+}
+
+id<MTLComputePipelineState> getBFSTraverseAtomPipeline()
+{
+    static id<MTLComputePipelineState> s_pipe = nil;
+    if (!s_pipe)
+    {
+        MetalContext &ctx = MetalContext::getInstance();
+        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutBFSTraverseAtomSrc;
+        id<MTLFunction> fn = ctx.getMetalFunction(src, "bfsTraverseAtomKernel");
+        if (!fn) return nil;
+        NSError *err = nil;
+        s_pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+        if (!s_pipe || err)
+        {
+            CV_Error(cv::Error::StsError, "Failed to create bfsTraverseAtom pipeline");
+        }
+    }
+    return s_pipe;
 }
 
 id<MTLComputePipelineState> MetalGraphCut::getLabelSegmentationPipeline()
@@ -336,6 +637,25 @@ id<MTLComputePipelineState> getCheckExcessPipeline()
         id<MTLFunction> fn=ctx.getMetalFunction(kGraphCutCheckExcessSrc,"checkExcessKernel");
         if(!fn) return nil; NSError*err=nil;
         s_pipe=[ctx.device newComputePipelineStateWithFunction:fn error:&err];
+    }
+    return s_pipe;
+}
+
+// getter for relabel pipeline
+static id<MTLComputePipelineState> getRelabelAtomPipeline()
+{
+    static id<MTLComputePipelineState> s_pipe = nil;
+    if (!s_pipe)
+    {
+        MetalContext &ctx = MetalContext::getInstance();
+        id<MTLFunction> fn = ctx.getMetalFunction(kGraphCutRelabelAtomSrc, "relabelAtomKernel");
+        if (!fn) return nil;
+        NSError *err = nil;
+        s_pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+        if (!s_pipe || err)
+        {
+            CV_Error(cv::Error::StsError, "Failed to create relabelAtom pipeline");
+        }
     }
     return s_pipe;
 }
@@ -379,6 +699,14 @@ void MetalGraphCut::allocateGraphBuffers()
     if (!m_excessFlag)
         m_excessFlag = [dev newBufferWithLength:sizeof(uint32_t)
                                    options:MTLResourceStorageModeShared];
+
+    // Slice 1: allocate atomic buffers (NodeDataAtom 8 bytes, Residual4Atom 16 bytes)
+    if (!m_nodeDataAtom)
+        m_nodeDataAtom = [dev newBufferWithLength:count * 8
+                                          options:MTLResourceStorageModePrivate];
+    if (!m_residualAtom)
+        m_residualAtom = [dev newBufferWithLength:count * 16
+                                          options:MTLResourceStorageModePrivate];
 }
 
 void MetalGraphCut::buildGraph(const MetalMat& unary_bg,
@@ -417,6 +745,52 @@ void MetalGraphCut::buildGraph(const MetalMat& unary_bg,
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
         [enc endEncoding];
     }
+
+    // --- New atomic graph build ---
+    id<MTLComputePipelineState> atomPipe = getBuildGraphAtomPipeline();
+    if(atomPipe){
+        @autoreleasepool{
+            id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
+            [enc setComputePipelineState:atomPipe];
+            [enc setTexture:unary_bg.texture() atIndex:0];
+            [enc setTexture:unary_fg.texture() atIndex:1];
+            [enc setTexture:pairwise_left.texture()      atIndex:2];
+            [enc setTexture:pairwise_topleft.texture()   atIndex:3];
+            [enc setTexture:pairwise_top.texture()       atIndex:4];
+            [enc setTexture:pairwise_topright.texture()  atIndex:5];
+
+            [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
+            // Correct buffer order: buildGraphAtomKernel expects terminal flow at index 1 and residual caps at index 2
+            [enc setBuffer:m_terminalFlow offset:0 atIndex:1];
+            [enc setBuffer:m_residualAtom offset:0 atIndex:2];
+
+            MTLSize tg=MTLSizeMake(16,16,1);
+            MTLSize grid=MTLSizeMake((m_graphSize.width+15)/16,(m_graphSize.height+15)/16,1);
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            [enc endEncoding];
+        }
+    }
+
+    // Initialize atomic frontier list based on labels (currently labels are 0; no frontier). For now we just clear levelCount.
+    uint32_t zero32=0; memcpy([m_levelCount contents], &zero32, sizeof(uint32_t));
+
+    id<MTLComputePipelineState> bfsInitAtom = getBFSInitAtomPipeline();
+    if(bfsInitAtom){
+        @autoreleasepool{
+            id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
+            [enc setComputePipelineState:bfsInitAtom];
+            [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
+            [enc setBuffer:m_levelCount offset:0 atIndex:1];
+            [enc setBuffer:m_currLevel offset:0 atIndex:2];
+            uint total=(uint)(m_graphSize.width*m_graphSize.height);
+            [enc setBytes:&total length:sizeof(uint) atIndex:3];
+
+            MTLSize tg=MTLSizeMake(256,1,1);
+            MTLSize grid=MTLSizeMake((total+tg.width-1)/tg.width,1,1);
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            [enc endEncoding];
+        }
+    }
 }
 
 void MetalGraphCut::solve(int /*iterations*/)
@@ -449,23 +823,21 @@ void MetalGraphCut::solve(int /*iterations*/)
     }
 
     uint32_t levelCnt = *(uint32_t*)[m_levelCount contents];
-    id<MTLComputePipelineState> travPipe = getBFSTraversePipeline();
+    id<MTLComputePipelineState> travPipe = getBFSTraverseAtomPipeline();
     uint iter = 0;
-    while (levelCnt > 0 && iter < 1000) // safety cap
+    while (levelCnt > 0 && iter < 1000)
     {
-        // Reset nextLevel counter
-        uint32_t zero32 = 0;
-        memcpy([m_levelCount contents], &zero32, sizeof(uint32_t));
+        uint32_t zero32 = 0; memcpy([m_levelCount contents], &zero32, sizeof(uint32_t));
 
         @autoreleasepool {
             id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
             [enc setComputePipelineState:travPipe];
-            [enc setBuffer:m_nodeData offset:0 atIndex:0];
-            [enc setBuffer:m_levelCount offset:0 atIndex:1]; // atomic nextCount
+            [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
+            [enc setBuffer:m_residualAtom offset:0 atIndex:1];
             [enc setBuffer:m_currLevel offset:0 atIndex:2];
             [enc setBytes:&levelCnt length:sizeof(uint32_t) atIndex:3];
-            [enc setBuffer:m_nextLevel offset:0 atIndex:4];
-            [enc setBuffer:m_residualCap offset:0 atIndex:5];
+            [enc setBuffer:m_levelCount offset:0 atIndex:4]; // nextCount atomic
+            [enc setBuffer:m_nextLevel offset:0 atIndex:5];
             uint widthVal = (uint)m_graphSize.width;
             [enc setBytes:&widthVal length:sizeof(uint) atIndex:6];
 
@@ -477,50 +849,61 @@ void MetalGraphCut::solve(int /*iterations*/)
 
         m_stream.syncCPU();
         levelCnt = *(uint32_t*)[m_levelCount contents];
-
-        // swap buffers
         std::swap(m_currLevel, m_nextLevel);
         ++iter;
     }
 
-    // ----- Placeholder push-relabel single pass -----
-
-    // Reset excessFlag to 1 to enter loop
-    uint32_t one = 1; memcpy([m_excessFlag contents], &one, sizeof(uint32_t));
-    uint prIter = 0;
-    id<MTLComputePipelineState> pushPipe = getPushPipeline();
-    id<MTLComputePipelineState> chkPipe  = getCheckExcessPipeline();
-
-    while (one && prIter < 1) // currently single iteration until pushKernel implemented
+    id<MTLComputePipelineState> pushPipe = getPushAtomPipeline();
+    uint32_t one = 1; // Track if any excess remains
+    int prIter = 0;
+    const int kMaxPRIters = 1000; // Maximum push-relabel iterations
+    while (one && prIter < kMaxPRIters)
     {
-        // push
+        // zero nextCount
+        uint32_t zero32 = 0; memcpy([m_levelCount contents], &zero32, sizeof(uint32_t));
+        zero32 = 0; memcpy([m_excessFlag contents], &zero32, sizeof(uint32_t));
+
         @autoreleasepool {
             id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
             [enc setComputePipelineState:pushPipe];
-            [enc setBuffer:m_nodeData offset:0 atIndex:0];
-            [enc setBuffer:m_excessFlag offset:0 atIndex:1];
-            [enc setBytes:&(m_graphSize.width * m_graphSize.height) length:sizeof(uint) atIndex:2];
-            MTLSize grid=MTLSizeMake(1,1,1); MTLSize tg=MTLSizeMake(1,1,1);
-            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
-            [enc endEncoding];
-        }
-
-        // check
-        @autoreleasepool {
-            id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
-            [enc setComputePipelineState:chkPipe];
-            [enc setBuffer:m_excessFlag offset:0 atIndex:0];
-            [enc setBuffer:m_excessFlag offset:0 atIndex:1];
-            MTLSize grid=MTLSizeMake(1,1,1); MTLSize tg=MTLSizeMake(1,1,1);
+            [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
+            [enc setBuffer:m_residualAtom offset:0 atIndex:1];
+            [enc setBuffer:m_currLevel offset:0 atIndex:2];
+            uint activeCountVal = levelCnt;
+            [enc setBytes:&activeCountVal length:sizeof(uint) atIndex:3];
+            [enc setBuffer:m_levelCount offset:0 atIndex:4]; // nextCount (atomic)
+            [enc setBuffer:m_nextLevel offset:0 atIndex:5];
+            [enc setBuffer:m_terminalFlow offset:0 atIndex:6];
+            [enc setBuffer:m_excessFlag offset:0 atIndex:7];
+            MTLSize tg = MTLSizeMake(256,1,1);
+            MTLSize grid = MTLSizeMake((activeCountVal + 255)/256,1,1);
             [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
             [enc endEncoding];
         }
 
         m_stream.syncCPU();
         one = *(uint32_t*)[m_excessFlag contents];
+        levelCnt = *(uint32_t*)[m_levelCount contents];
+        std::swap(m_currLevel, m_nextLevel);
         ++prIter;
     }
 
+    id<MTLComputePipelineState> relabelPipe = getRelabelAtomPipeline();
+    if(relabelPipe){
+        @autoreleasepool{
+            id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
+            [enc setComputePipelineState:relabelPipe];
+            [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
+            [enc setBuffer:m_currLevel offset:0 atIndex:1]; // activeList
+            uint activeCount = levelCnt;
+            [enc setBytes:&activeCount length:sizeof(uint) atIndex:2];
+
+            MTLSize tg=MTLSizeMake(256,1,1);
+            MTLSize grid=MTLSizeMake((activeCount+tg.width-1)/tg.width,1,1);
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            [enc endEncoding];
+        }
+    }
 }
 
 void MetalGraphCut::getSegmentation(MetalMat& mask)
@@ -528,17 +911,20 @@ void MetalGraphCut::getSegmentation(MetalMat& mask)
     if (mask.empty())
         mask.create(m_graphSize, CV_8UC1);
 
-    id<MTLComputePipelineState> pipe = getLabelSegmentationPipeline();
-    CV_Assert(pipe);
+    // Temporary fallback: derive segmentation directly from unary terms while
+    // the full push-relabel solver is still under development. Once the atomic
+    // BFS / push-relabel pipeline is feature-complete we will switch back to
+    // the labelSegmentationKernel.
 
-    uint widthVal = (uint)m_graphSize.width;
+    id<MTLComputePipelineState> pipe = getSimpleSegmentationPipeline();
+    CV_Assert(pipe);
 
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
         [enc setComputePipelineState:pipe];
-        [enc setBuffer:m_nodeData offset:0 atIndex:0];
-        [enc setTexture:mask.texture() atIndex:0];
-        [enc setBytes:&widthVal length:sizeof(uint) atIndex:1];
+        [enc setTexture:m_bgTermTex atIndex:0];
+        [enc setTexture:m_fgTermTex atIndex:1];
+        [enc setTexture:mask.texture() atIndex:2];
 
         MTLSize tg = MTLSizeMake(16,16,1);
         MTLSize grid = MTLSizeMake((m_graphSize.width + tg.width -1)/tg.width,

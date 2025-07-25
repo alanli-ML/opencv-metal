@@ -3,10 +3,26 @@
 #ifdef HAVE_METAL
 
 #include "opencv2/imgproc/detail/gcgraph.hpp"
-#include "opencv2/imgproc/grabcut_shared.hpp"
 #include "gmm_internal.hpp"
 #include "graphcut_internal.hpp"
 #include <memory>
+namespace cv { namespace metal {
+
+// Forward declaration for k-means from clustering.mm
+double kmeans(const MetalMat& data, int K, MetalMat& bestLabels, 
+             TermCriteria criteria, int attempts, int flags, MetalMat& centers, Stream& stream);
+
+}} // end cv::metal namespace temporarily
+
+// Forward declaration for the enhanced Metal function
+namespace cv { namespace metal {
+void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compIdxs, 
+                       bool useMetalKMeans = false, uint64_t seed = 0, Stream* stream = nullptr);
+}} // cv::metal
+
+namespace cv { namespace metal {
+
+// Removed unused kmeansComponentMap function
 
 // Set this to 1 to begin testing the full-GPU graph-cut solver. Until the
 // MetalGraphCut implementation is ready, leave at 0 so the CPU fallback stays
@@ -15,18 +31,195 @@
 #define USE_METAL_GRAPHCUT 0
 #endif
 
+}} // end cv::metal namespace temporarily for CPU helper functions
+
 // (Removed unused extern enableCPUKMeansMode)
 
-// CPU k-means initialization function that matches the CPU GrabCut implementation
-void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compIdxs) {
+namespace cv { namespace metal {
+
+// Enhanced k-means initialization function that can use either CPU or Metal backend
+void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compIdxs, 
+                       bool useMetalKMeans, uint64_t seed, Stream* stream) {
     const int kMeansItCount = 10;
     const int kMeansType = cv::KMEANS_PP_CENTERS;
     const int componentsCount = 5; // Match GMM::componentsCount
     
+    // Set deterministic seed if provided
+    if (seed != 0) {
+        cv::theRNG().state = seed;
+    }
+    
+    if (useMetalKMeans && stream) {
+        // METAL PATH: Use direct mask-based k-means without intermediate samples
+        printf("=== USING METAL K-MEANS INITIALIZATION ===\n");
+        try {
+            // Convert input image to BGRA format for Metal
+            cv::Mat imgBGRA;
+            if (img.channels() == 3) {
+                cv::cvtColor(img, imgBGRA, cv::COLOR_BGR2BGRA);
+            } else {
+                imgBGRA = img.clone();
+            }
+            
+            // Upload to Metal
+            cv::metal::MetalMat metalImg, metalMask;
+            metalImg.upload(imgBGRA);
+            metalMask.upload(mask);
+            
+            // Run mask-based k-means for background and foreground separately
+            cv::metal::MetalMat bgLabels, fgLabels;
+            cv::Mat bgCentroids, fgCentroids;
+            
+            // Cluster background pixels (GC_BGD and GC_PR_BGD)
+            cv::metal::kmeansClusterByMask(metalImg, metalMask, true, bgLabels, bgCentroids, *stream);
+            
+            // Cluster foreground pixels (GC_FGD and GC_PR_FGD)
+            cv::metal::kmeansClusterByMask(metalImg, metalMask, false, fgLabels, fgCentroids, *stream);
+            
+            // Download label results
+            cv::Mat h_bgLabels, h_fgLabels;
+            bgLabels.download(h_bgLabels, *stream, true);
+            fgLabels.download(h_fgLabels, *stream, true);
+            
+            // Create component index map
+            compIdxs.create(img.size(), CV_8UC1);
+            compIdxs.setTo(0); // Initialize all pixels to component 0
+            
+            // Count component assignments for debugging
+            std::vector<int> metalBgComponentCounts(componentsCount, 0);
+            std::vector<int> metalFgComponentCounts(componentsCount, 0);
+            
+            // CRITICAL FIX: The kmeansClusterByMask kernel writes default label=0 to pixels
+            // that don't belong to the target class. We must only use labels from the 
+            // appropriate texture for pixels that actually belong to that class.
+            
+            cv::Point p;
+            for (p.y = 0; p.y < img.rows; p.y++) {
+                for (p.x = 0; p.x < img.cols; p.x++) {
+                    uchar maskVal = mask.at<uchar>(p);
+                    if (maskVal == cv::GC_BGD || maskVal == cv::GC_PR_BGD) {
+                        // Background pixel - only use bgLabels for actual background pixels
+                        // bgLabels contains valid k-means results for background pixels (0-4)
+                        // and default value 0 for foreground pixels (which we ignore)
+                        int label = h_bgLabels.at<int>(p.y, p.x);
+                        label = std::max(0, std::min(label, componentsCount - 1));
+                        compIdxs.at<uchar>(p) = (uchar)label;
+                        metalBgComponentCounts[label]++;
+                    } else if (maskVal == cv::GC_FGD || maskVal == cv::GC_PR_FGD) {
+                        // Foreground pixel - only use fgLabels for actual foreground pixels
+                        // fgLabels contains valid k-means results for foreground pixels (0-4)
+                        // and default value 0 for background pixels (which we ignore)
+                        int label = h_fgLabels.at<int>(p.y, p.x);
+                        label = std::max(0, std::min(label, componentsCount - 1));
+                        compIdxs.at<uchar>(p) = (uchar)label;
+                        metalFgComponentCounts[label]++;
+                    }
+                }
+            }
+            
+            // VALIDATION: Check for potential data issues
+            int totalBgPixels = 0, totalFgPixels = 0;
+            int actualBgPixels = 0, actualFgPixels = 0;
+            for (int y = 0; y < img.rows; y++) {
+                for (int x = 0; x < img.cols; x++) {
+                    uchar maskVal = mask.at<uchar>(y, x);
+                    if (maskVal == cv::GC_BGD || maskVal == cv::GC_PR_BGD) {
+                        actualBgPixels++;
+                    } else if (maskVal == cv::GC_FGD || maskVal == cv::GC_PR_FGD) {
+                        actualFgPixels++;
+                    }
+                }
+            }
+            
+            for (int i = 0; i < componentsCount; i++) {
+                totalBgPixels += metalBgComponentCounts[i];
+                totalFgPixels += metalFgComponentCounts[i];
+            }
+            
+            // Debug: Print component assignment statistics with validation
+            printf("=== METAL K-MEANS COMPONENT ASSIGNMENT (FIXED) ===\n");
+            printf("Background: %d actual pixels, %d assigned to components\n", actualBgPixels, totalBgPixels);
+            for (int i = 0; i < componentsCount; i++) {
+                printf("  Component %d: %d pixels\n", i, metalBgComponentCounts[i]);
+            }
+            printf("Foreground: %d actual pixels, %d assigned to components\n", actualFgPixels, totalFgPixels);
+            for (int i = 0; i < componentsCount; i++) {
+                printf("  Component %d: %d pixels\n", i, metalFgComponentCounts[i]);
+            }
+            
+            // VALIDATION: Verify all pixels are accounted for
+            if (totalBgPixels != actualBgPixels) {
+                printf("WARNING: Background pixel count mismatch! Expected %d, got %d\n", actualBgPixels, totalBgPixels);
+            }
+            if (totalFgPixels != actualFgPixels) {
+                printf("WARNING: Foreground pixel count mismatch! Expected %d, got %d\n", actualFgPixels, totalFgPixels);
+            }
+            
+            // Debug: Print centroids
+            printf("Background centroids (BGR, [0-255]):\n");
+            if (!bgCentroids.empty()) {
+                for (int i = 0; i < componentsCount; i++) {
+                    printf("  Centroid %d: (%.1f, %.1f, %.1f)\n", i,
+                           bgCentroids.at<float>(i, 0), bgCentroids.at<float>(i, 1), bgCentroids.at<float>(i, 2));
+                }
+            } else {
+                printf("  (centroids empty)\n");
+            }
+            printf("Foreground centroids (BGR, [0-255]):\n");
+            if (!fgCentroids.empty()) {
+                for (int i = 0; i < componentsCount; i++) {
+                    printf("  Centroid %d: (%.1f, %.1f, %.1f)\n", i,
+                           fgCentroids.at<float>(i, 0), fgCentroids.at<float>(i, 1), fgCentroids.at<float>(i, 2));
+                }
+            } else {
+                printf("  (centroids empty)\n");
+            }
+            
+            // Check for uninitialized pixels
+            int uninitializedCount = 0;
+            for (int y = 0; y < compIdxs.rows; y++) {
+                for (int x = 0; x < compIdxs.cols; x++) {
+                    uchar maskVal = mask.at<uchar>(y, x);
+                    uchar compVal = compIdxs.at<uchar>(y, x);
+                    if (maskVal <= 3 && compVal > 4) {
+                        uninitializedCount++;
+                    }
+                }
+            }
+            printf("Uninitialized pixels: %d\n", uninitializedCount);
+            
+            // Debug: Show actual component values for some pixels
+            printf("\nSample component assignments after k-means:\n");
+            int sampleCount = 0;
+            for (int y = 0; y < compIdxs.rows && sampleCount < 20; y += compIdxs.rows / 5) {
+                for (int x = 0; x < compIdxs.cols && sampleCount < 20; x += compIdxs.cols / 5) {
+                    uchar maskVal = mask.at<uchar>(y, x);
+                    uchar compVal = compIdxs.at<uchar>(y, x);
+                    const char* maskType = (maskVal == cv::GC_BGD) ? "BGD" : 
+                                         (maskVal == cv::GC_FGD) ? "FGD" :
+                                         (maskVal == cv::GC_PR_BGD) ? "PR_BGD" : "PR_FGD";
+                    printf("  (%d,%d): mask=%s, component=%d\n", x, y, maskType, (int)compVal);
+                    sampleCount++;
+                }
+            }
+            
+            printf("==========================================\n");
+            
+            return; // Success - exit early
+            
+        } catch (const cv::Exception& e) {
+            printf("Metal K-means failed: %s\n", e.what());
+            // Fall through to CPU implementation
+        }
+    }
+    
+    // CPU PATH: Traditional sample-based approach (fallback or when Metal disabled)
+    printf("=== USING CPU K-MEANS INITIALIZATION (useMetalKMeans=%d, stream=%p) ===\n", useMetalKMeans, stream);
+    
     cv::Mat bgdLabels, fgdLabels;
     std::vector<cv::Vec3f> bgdSamples, fgdSamples;
     
-    // Collect background and foreground pixel samples (exact copy of CPU logic)
+    // Collect background and foreground pixel samples
     cv::Point p;
     for (p.y = 0; p.y < img.rows; p.y++) {
         for (p.x = 0; p.x < img.cols; p.x++) {
@@ -40,32 +233,48 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
     
     CV_Assert(!bgdSamples.empty() && !fgdSamples.empty());
     
-        // Perform k-means clustering on background samples (exact copy of CPU logic)
+
+    
+    // Perform k-means clustering on background samples
+    cv::Mat bgdCenters, fgdCenters;
     {
         cv::Mat _bgdSamples((int)bgdSamples.size(), 3, CV_32FC1, &bgdSamples[0][0]);
         int num_clusters = componentsCount;
         num_clusters = std::min(num_clusters, (int)bgdSamples.size());
+        
+
         cv::kmeans(_bgdSamples, num_clusters, bgdLabels,
-                   cv::TermCriteria(cv::TermCriteria::MAX_ITER, kMeansItCount, 0.0), 0, kMeansType);
+                  cv::TermCriteria(cv::TermCriteria::MAX_ITER, kMeansItCount, 0.0), 0, kMeansType, bgdCenters);
         
         // Validate K-means results to prevent bounds errors
         CV_Assert(!bgdLabels.empty() && bgdLabels.cols >= 1 && bgdLabels.type() == CV_32SC1);
+        
+
     }
 
-    // Perform k-means clustering on foreground samples (exact copy of CPU logic)  
+    // Perform k-means clustering on foreground samples
     {
         cv::Mat _fgdSamples((int)fgdSamples.size(), 3, CV_32FC1, &fgdSamples[0][0]);
         int num_clusters = componentsCount;
         num_clusters = std::min(num_clusters, (int)fgdSamples.size());
+        
+
         cv::kmeans(_fgdSamples, num_clusters, fgdLabels,
-                   cv::TermCriteria(cv::TermCriteria::MAX_ITER, kMeansItCount, 0.0), 0, kMeansType);
+                  cv::TermCriteria(cv::TermCriteria::MAX_ITER, kMeansItCount, 0.0), 0, kMeansType, fgdCenters);
         
         // Validate K-means results to prevent bounds errors
         CV_Assert(!fgdLabels.empty() && fgdLabels.cols >= 1 && fgdLabels.type() == CV_32SC1);
+        
+
     }
     
     // Create component index map for all pixels
     compIdxs.create(img.size(), CV_8UC1); // Use 8-bit to match Metal texture format
+    compIdxs.setTo(0); // Initialize all pixels to component 0
+    
+    // Count CPU component assignment
+    std::vector<int> cpuBgComponentCounts(componentsCount, 0);
+    std::vector<int> cpuFgComponentCounts(componentsCount, 0);
     
     // Assign background pixels to their k-means clusters
     int bgdIdx = 0;
@@ -78,15 +287,17 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
                     // Ensure label is within valid component range [0, componentsCount-1]
                     label = std::max(0, std::min(label, componentsCount - 1));
                     compIdxs.at<uchar>(p) = (uchar)label;
+                    cpuBgComponentCounts[label]++;
                     bgdIdx++;
                 } else {
                     compIdxs.at<uchar>(p) = 0; // Fallback to component 0
+                    cpuBgComponentCounts[0]++;
                 }
             }
         }
     }
     
-        // Assign foreground pixels to their k-means clusters
+    // Assign foreground pixels to their k-means clusters
     int fgdIdx = 0;
     for (p.y = 0; p.y < img.rows; p.y++) {
         for (p.x = 0; p.x < img.cols; p.x++) {
@@ -96,15 +307,32 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
                     int label = fgdLabels.at<int>(fgdIdx, 0);
                     // Ensure label is within valid component range [0, componentsCount-1]
                     label = std::max(0, std::min(label, componentsCount - 1));
-                    // Assign to foreground components 5-9 (add componentsCount offset)
-                    compIdxs.at<uchar>(p) = (uchar)label + componentsCount;
+                    // CRITICAL FIX: Components are always 0-4, mask determines which GMM to use
+                    compIdxs.at<uchar>(p) = (uchar)label;
+                    cpuFgComponentCounts[label]++;
                     fgdIdx++;
                 } else {
-                    compIdxs.at<uchar>(p) = componentsCount; // Fallback to component 5
+                    // CRITICAL FIX: Components are always 0-4, mask determines which GMM to use
+                    compIdxs.at<uchar>(p) = 0;
+                    cpuFgComponentCounts[0]++;
                 }
             }
         }
     }
+    
+
+}
+
+// Legacy CPU-only version for backwards compatibility
+void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compIdxs) {
+    initGMMsWithKMeans(img, mask, compIdxs, false, 0, nullptr);
+}
+
+}} // cv::metal
+
+// CPU-only entry point outside cv::metal namespace for global access
+void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compIdxs) {
+    cv::metal::initGMMsWithKMeans(img, mask, compIdxs, false, 0, nullptr);
 }
 
 namespace cv { namespace metal {
@@ -139,11 +367,11 @@ private:
                          const MetalMat& bgTerm, const MetalMat& fgTerm,
                          const MetalMat& leftW, const MetalMat& topleftW, 
                          const MetalMat& topW, const MetalMat& toprightW,
-                         double lambda, cv::detail::GCGraph<double>& graph, Stream& stream);
+                         double lambda, ::cv::detail::GCGraph<double>& graph, Stream& stream);
     
-    void estimateSegmentation(cv::detail::GCGraph<double>& graph, MetalMat& mask, Stream& stream);
+    void estimateSegmentation(::cv::detail::GCGraph<double>& graph, MetalMat& mask, Stream& stream);
     
-    cv::Ptr<GMM> m_gmm;
+    ::cv::Ptr<GMM> m_gmm;
     MetalMat m_pairwiseWeights[4]; // left, topleft, top, topright
     MetalMat m_components;
     MetalMat m_bgTerm, m_fgTerm;
@@ -154,6 +382,29 @@ private:
 
     // Placeholder for upcoming full-GPU graph-cut implementation
     std::unique_ptr<MetalGraphCut> m_metalGraphCut;
+
+    // Unified K-means component initialization using shared CPU/Metal utility
+    void initGMMsWithMetalKMeans(const MetalMat& imageBGRA, MetalMat& mask, uint64_t seed, Stream& stream) {
+        if (m_components.empty()) {
+            // Download to CPU for the shared utility function
+            cv::Mat h_img, h_mask;
+            imageBGRA.download(h_img, stream, true);
+            mask.download(h_mask, stream, true);
+            
+            // Convert BGRA to BGR for OpenCV compatibility
+            cv::Mat h_bgr;
+            cv::cvtColor(h_img, h_bgr, cv::COLOR_BGRA2BGR);
+            
+                         // Use Metal K-means for component initialization
+             cv::Mat componentMap;
+             initGMMsWithKMeans(h_bgr, h_mask, componentMap, true, seed, &stream);
+            
+            // Upload the component map back to Metal
+            m_components.upload(componentMap);
+        }
+        m_gmm->learnGMMs(imageBGRA, mask, m_components, stream);
+        stream.syncCPU();
+    }
 };
 
 GrabCutImpl::GrabCutImpl() : m_beta(0.0), m_initialized(false) {
@@ -197,9 +448,17 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
             image.download(h_image, stream, true);
             mask.download(h_mask, stream, true);
             
-            // Perform CPU k-means clustering to get initial component assignments
+            // Convert BGRA to BGR if needed
+            cv::Mat h_img_bgr;
+            if (h_image.channels() == 4) {
+                cv::cvtColor(h_image, h_img_bgr, cv::COLOR_BGRA2BGR);
+            } else {
+                h_img_bgr = h_image;
+            }
+            
+            // Perform k-means clustering using shared utility (try Metal k-means first)
             cv::Mat h_components;
-            initGMMsWithKMeans(h_image, h_mask, h_components);
+            cv::metal::initGMMsWithKMeans(h_img_bgr, h_mask, h_components, true, 0, &stream);
             
             // Upload the k-means component assignments to Metal
             m_components.upload(h_components);
@@ -289,7 +548,7 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         // Keep everything on the GPU – do NOT syncCPU().
         if (!m_metalGraphCut)
         {
-            m_metalGraphCut = std::make_unique<MetalGraphCut>(image.size(), stream);
+            m_metalGraphCut.reset(new MetalGraphCut(image.size(), stream));
         }
 
         // Build the graph directly on the GPU from unary & pairwise terms
@@ -316,7 +575,7 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
 
         // PHASE 3: CPU-bound operations (these don't use streams since they're CPU-only)
         // Construct graph and solve min-cut max-flow on CPU
-        cv::detail::GCGraph<double> graph;
+        ::cv::detail::GCGraph<double> graph;
         constructGCGraph(image, mask, m_bgTerm, m_fgTerm,
                         m_pairwiseWeights[0], m_pairwiseWeights[1],
                         m_pairwiseWeights[2], m_pairwiseWeights[3],
@@ -333,162 +592,6 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
     }
 }
 
-void GrabCutImpl::runWithSharedKMeans(const MetalMat& image, MetalMat& mask, const Rect& rect,
-                                     MetalMat& bgdModel, MetalMat& fgdModel,
-                                     int iterCount, int mode, uint64_t randomSeed, Stream& stream) {
-    
-    CV_Assert(!image.empty());
-    CV_Assert(image.type() == CV_8UC4 || image.type() == CV_8UC3);
-    
-    m_imageSize = image.size();
-    
-    // Initialize GMM if not already done
-    if (!m_gmm || m_imageSize != m_gmm->size()) {
-        m_gmm = createGMM(m_imageSize);
-        m_initialized = false;
-    }
-    
-    // Initialize mask and models if needed
-    if (mode == GC_INIT_WITH_RECT || mode == GC_INIT_WITH_MASK) {
-        if (mode == GC_INIT_WITH_RECT) {
-            initMaskWithRect(mask, m_imageSize, rect, stream);
-        } else {
-            checkMask(image, mask);
-        }
-        
-        // Initialize GMMs only if not already initialized
-        if (!m_initialized) {
-            // Download CPU versions for shared K-means clustering and initial learning
-            cv::Mat h_image, h_mask;
-            image.download(h_image, stream, true);
-            mask.download(h_mask, stream, true);
-            
-            // CRITICAL: Convert to BGR for shared K-means compatibility with CPU
-            cv::Mat h_image_bgr;
-            if (h_image.type() == CV_8UC4) {
-                cv::cvtColor(h_image, h_image_bgr, cv::COLOR_BGRA2BGR);
-            } else {
-                h_image_bgr = h_image;
-            }
-            
-            // CRITICAL: Fix MetalMat original channels tracking for BGRA images
-            // The image parameter has original_channels_=3, but we need it as 4 for GMM learning
-            const_cast<MetalMat&>(image).setOriginalChannels(4);
-            
-            // Use shared deterministic K-means with fixed seed
-            setRNGSeed(randomSeed); // Reset RNG to exact same state as CPU
-            cv::SharedKMeansResult sharedKMeans = cv::performDeterministicKMeans(h_image_bgr, h_mask, randomSeed);
-            
-            // Create component assignments for Metal format (8UC1)
-            cv::Mat h_components;
-            cv::createComponentIndexMap(h_image_bgr, h_mask, sharedKMeans, h_components, 0, 5); // Use explicit 0 instead of CV_8UC1
-            
-            // Upload the shared K-means component assignments to Metal
-            m_components.upload(h_components);
-            
-            // CRITICAL DEBUG: Verify component assignments were uploaded correctly  
-            
-            // Sample a few uploaded component values
-            
-            // Do initial GMM learning using shared K-means assignments on the input stream
-            m_gmm->learnGMMs(image, mask, m_components, stream);
-            
-            // Synchronize only when we need to extract parameters for output
-            stream.syncCPU();
-            
-            // CRITICAL FIX: Extract learned parameters even for 0 iterations (like regular path)
-            Mat tempBgdModel, tempFgdModel;
-            m_gmm->extractGMMParameters(tempBgdModel, tempFgdModel);
-            bgdModel.upload(tempBgdModel);
-            fgdModel.upload(tempFgdModel);
-            
-            m_initialized = true;
-        }
-    }
-    
-    // Calculate beta parameter and pairwise weights for all modes that need graph construction
-    m_beta = calcBeta(image, stream);
-    
-    // Calculate pairwise weights
-    const double gamma = 50.0;
-    calcNWeights(image, m_pairwiseWeights[0], m_pairwiseWeights[1], 
-                m_pairwiseWeights[2], m_pairwiseWeights[3], 
-                m_beta, gamma, stream);
-    
-    if (iterCount <= 0) return;
-    
-    if (mode == GC_EVAL_FREEZE_MODEL) {
-        iterCount = 1;
-    }
-    
-    if (mode == GC_EVAL || mode == GC_EVAL_FREEZE_MODEL) {
-        checkMask(image, mask);
-    }
-    
-    // Create previous mask for convergence checking
-    m_prevMask.create(mask.size(), mask.type());
-    
-    // Main GrabCut iterative loop
-    const double lambda = 9.0 * 50.0; // 9 * gamma (450)
-    
-    for (int iter = 0; iter < iterCount; iter++) {
-        
-        // DETAILED TRACKING: Extract and compare GMM parameters BEFORE this iteration
-        
-        // Sample a few GMM parameters to track divergence
-        
-        // Save current mask for convergence check
-        m_prevMask = mask.clone();
-
-        // PHASE 1: Batch all GPU operations on the input stream (NO intermediate commits)
-        // This allows GPU operations to pipeline and overlap for maximum performance
-        
-        // Ensure components texture exists for assignment
-        if (m_components.empty()) {
-            m_components.create(mask.size(), CV_8UC1);
-        }
-        
-        m_gmm->assignGMMs(image, mask, m_components, stream);
-        
-        // DETAILED TRACKING: Show component assignments after assignment
-        
-        // Learn GMM parameters (except in freeze model mode)  
-        if (mode != GC_EVAL_FREEZE_MODEL) {
-            m_gmm->learnGMMs(image, mask, m_components, stream);
-            stream.syncCPU(); // Ensure GPU learning completes before reading buffers
-
-            // Extract learned GMM parameters to output models for comparison with CPU
-            // Note: This is asynchronous - parameters will be available after stream commits
-            Mat tempBgdModel, tempFgdModel;
-            m_gmm->extractGMMParameters(tempBgdModel, tempFgdModel);
-            bgdModel.upload(tempBgdModel);
-            fgdModel.upload(tempFgdModel);
-        }
-        
-        // Compute unary potentials (data term) - still on same stream
-        m_gmm->computeDataTerm(image, mask, m_bgTerm, m_fgTerm, stream);
-        
-        // PHASE 2: Single synchronization point - only when CPU needs GPU data
-        // This is the ONLY place we should synchronize in the entire iteration
-        stream.syncCPU();
-        
-        // PHASE 3: CPU-bound operations (these don't use streams since they're CPU-only)
-        // Construct graph and solve min-cut max-flow on CPU
-        cv::detail::GCGraph<double> graph;
-        constructGCGraph(image, mask, m_bgTerm, m_fgTerm,
-                        m_pairwiseWeights[0], m_pairwiseWeights[1],
-                        m_pairwiseWeights[2], m_pairwiseWeights[3],
-                        lambda, graph, stream);
-        
-        // Estimate segmentation using max-flow
-        estimateSegmentation(graph, mask, stream);
-        
-        // Check for convergence
-        if (checkConvergence(m_prevMask, mask, stream)) {
-            break;
-        }
-    }
-}
 
 void GrabCutImpl::initMaskWithRect(MetalMat& mask, Size imageSize, const Rect& rect, Stream& stream) {
     mask.create(imageSize, CV_8UC1);
@@ -795,8 +898,9 @@ void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
     metal_fgdModel.upload(fgdModel.getMat());
     
     GrabCutImpl impl;
-    impl.runWithSharedKMeans(metal_img, metal_mask, rect, metal_bgdModel, metal_fgdModel, 
-                            iterCount, mode, randomSeed, stream);
+    // TODO: Pass randomSeed to run() method when Metal k-means is properly integrated
+    impl.run(metal_img, metal_mask, rect, metal_bgdModel, metal_fgdModel, 
+             iterCount, mode, stream);
     
     metal_mask.download(mask.getMatRef(), stream, true);
     metal_bgdModel.download(bgdModel.getMatRef(), stream, true);

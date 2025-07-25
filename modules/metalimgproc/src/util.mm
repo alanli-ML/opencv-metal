@@ -24,15 +24,11 @@ kernel void trimapFromRectKernel(texture2d<uint, access::write> mask [[texture(0
         gid.y >= rect_origin.y && gid.y < rect_origin.y + rect_size.y) {
         value_int = 3; // GC_PR_FGD (probable foreground)
     } 
-    // Everything else remains GC_BGD (sure background) - match CPU exactly
+    // Everything else is GC_BGD (sure background) - match CPU exactly
     
-    // For mask textures, we need to store the actual integer values 0-3
-    // Convert to normalized range but preserve the discrete values
-    // Store as discrete integer values directly in texture
-    // For MTLPixelFormatR8Unorm texture, values are normalized [0,1] 
-    // but we want discrete byte values [0,1,2,3] to be preserved
+    // ALWAYS write to ensure all pixels are initialized (Metal textures may contain garbage)
+    // For MTLPixelFormatR8Uint texture, we write integer values directly
     mask.write(value_int, gid);
-    
 }
 
 // Edge weight calculation helper

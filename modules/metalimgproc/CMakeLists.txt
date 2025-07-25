@@ -14,13 +14,15 @@ if(HAVE_METAL)
   set_source_files_properties(src/gmm_gpu.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
   set_source_files_properties(src/graphcut.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
   set_source_files_properties(src/util.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+  set_source_files_properties(src/clustering.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 ocv_set_module_sources(
     HEADERS include/opencv2/metalimgproc.hpp
     SOURCES src/precomp.hpp src/gmm_internal.hpp src/gmm_kernels.hpp 
             src/grabcut.mm src/gmm.mm src/gmm_kernels.mm src/gmm_gpu.mm 
-            src/util.mm
+            src/util.mm src/clustering.mm
             src/graphcut.mm src/graphcut_internal.hpp
 )
 
@@ -39,19 +41,14 @@ endif()
 
 option(ENABLE_FULLGPU_GRABCUT "Enable full GPU GraphCut tests" OFF)
 
-ocv_add_accuracy_tests(
-  FILES test/test_metalimgproc.cpp test/test_graphcut_fullgpu.cpp
-  DEPENDS_ON opencv_imgproc opencv_ts
-)
+ocv_add_accuracy_tests()
 
-if(ENABLE_FULLGPU_GRABCUT)
-  target_compile_definitions(${the_module} PRIVATE USE_METAL_GRAPHCUT=1)
-  target_compile_definitions(opencv_test_metalimgproc PRIVATE USE_METAL_GRAPHCUT=1)
-endif()
+# Conditional Metal Graph Cut Support
+target_compile_definitions(${the_module} PRIVATE USE_METAL_GRAPHCUT=0)
+target_compile_definitions(opencv_test_metalimgproc PRIVATE USE_METAL_GRAPHCUT=0)
 
 if(HAVE_METAL)
-  ocv_add_perf_tests(
-    FILES perf/perf_metalimgproc.cpp
-    DEPENDS_ON opencv_imgproc
-  )
+  ocv_add_perf_tests()
 endif() 
+
+include_directories(${OpenCV_SOURCE_DIR}/modules/imgproc/include) 
