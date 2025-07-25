@@ -54,7 +54,7 @@ CUDA_TEST_P(Metal_FilterBox, Accuracy)
 
 INSTANTIATE_TEST_CASE_P(Imgproc_Metal, Metal_FilterBox,
     testing::Combine(
-        testing::Values(szVGA, sz720p),
+        testing::Values(perf::szVGA, perf::sz720p),
         testing::Values(CV_8UC1, CV_8UC4, CV_32FC1),
         testing::Values(3, 5, 7),
         testing::Values(Point(-1, -1)),

@@ -38,3 +38,4 @@ claude-flow
 claude-flow.config.json
 claude-flow.ps1
 memory/claude-flow-data.json
+outputs

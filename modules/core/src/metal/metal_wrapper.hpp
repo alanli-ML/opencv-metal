@@ -42,13 +42,16 @@ class Stream::Impl
 {
 public:
     Impl();
-    Impl(id<MTLCommandBuffer> cmdBuf);
     ~Impl();
 
     id<MTLCommandBuffer> getCommandBuffer();
+    void commit();
+    void waitUntilCompleted();
+    void commitAndWait();
+    void syncCPU();
+    bool hasEnqueuedCommands() const;
 
     id<MTLCommandBuffer> commandBuffer;
-    bool owns_command_buffer;
 };
 
 }} // cv::metal

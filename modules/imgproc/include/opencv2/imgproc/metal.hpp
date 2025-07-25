@@ -43,6 +43,13 @@ CV_EXPORTS void medianBlur(const MetalMat& src, MetalMat& dst, int ksize, Stream
 CV_EXPORTS void matchTemplate(const MetalMat& image, const MetalMat& templ, MetalMat& result, int method, InputArray mask = noArray());
 CV_EXPORTS void matchTemplate(const MetalMat& image, const MetalMat& templ, MetalMat& result, int method, InputArray mask, Stream& stream);
 
+CV_EXPORTS int connectedComponents(const MetalMat& image, MetalMat& labels, int connectivity = 8, int ltype = CV_32S);
+CV_EXPORTS int connectedComponents(const MetalMat& image, MetalMat& labels, int connectivity, int ltype, Stream& stream);
+
+CV_EXPORTS double kmeans(const MetalMat& data, int K, MetalMat& bestLabels, TermCriteria criteria, int attempts, int flags, MetalMat& centers);
+CV_EXPORTS double kmeans(const MetalMat& data, int K, MetalMat& bestLabels, TermCriteria criteria, int attempts, int flags);
+CV_EXPORTS double kmeans(const MetalMat& data, int K, MetalMat& bestLabels, TermCriteria criteria, int attempts, int flags, MetalMat& centers, Stream& stream);
+
 //! @}
 }} // cv::metal
 

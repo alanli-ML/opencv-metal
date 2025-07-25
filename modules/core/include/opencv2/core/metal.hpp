@@ -27,6 +27,7 @@ namespace cv { namespace metal {
 //! @{
 
 class MetalMatData;
+class Stream;  // Forward declaration for use in MetalMat
 
 class CV_EXPORTS MetalMat
 {
@@ -44,7 +45,8 @@ public:
     MetalMat& operator=(const MetalMat& m);
 
     void upload(const Mat& m);
-    void download(Mat& m) const;
+    void download(Mat& m) const;  // Convenience method (blocking) - creates own stream
+    void download(Mat& m, Stream& stream, bool sync = true) const;  // Stream-aware async download like CUDA
 
     //! returns a deep copy of the MetalMat
     MetalMat clone() const;
@@ -64,6 +66,10 @@ public:
     size_t elemSize() const { return CV_ELEM_SIZE(type()); }
     size_t elemSize1() const { return CV_ELEM_SIZE1(type()); }
 
+    // Set the number of channels in the original host Mat (e.g., 3 when data is stored as BGRA in texture)
+    void setOriginalChannels(int cn);
+    int  getOriginalChannels() const { return original_channels_; }
+
     id texture() const;
 
     void create(int _rows, int _cols, int _type);
@@ -71,6 +77,7 @@ public:
 
 private:
     void release();
+    void downloadImpl(Mat& m) const;  // Common download implementation for both sync and async versions
 
     int flags;
     int rows_, cols_;
@@ -78,13 +85,13 @@ private:
     size_t offset;
     size_t step[2];
     id texture_not_owned_;
+    int original_channels_; // number of channels in original host Mat (may be 3 while stored as 4)
 };
 
 class CV_EXPORTS_W Stream
 {
 public:
     CV_WRAP Stream();
-    explicit Stream(id commandBuffer);
     ~Stream();
 
     Stream(const Stream&);
@@ -93,7 +100,9 @@ public:
     CV_WRAP void commit();
     CV_WRAP void waitUntilCompleted();
     CV_WRAP void commitAndWait();
+    CV_WRAP void syncCPU();  // Commit, wait, and create replacement buffer for continued usage
     CV_WRAP bool hasEnqueuedCommands() const;
+
 
     class Impl;
     Ptr<Impl> impl;
@@ -101,6 +110,11 @@ public:
 
 struct CV_EXPORTS StreamAccessor
 {
+    // Encoder creation methods - avoid exposing raw command buffers
+    static id createComputeEncoder(const Stream& stream);
+    static id createBlitEncoder(const Stream& stream);
+    
+    // Legacy method (deprecated) - should not be used in new code
     static id getCommandBuffer(const Stream& stream);
 };
 

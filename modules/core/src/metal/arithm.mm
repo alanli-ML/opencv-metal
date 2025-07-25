@@ -15,6 +15,7 @@ void add(const MetalMat& src1, const MetalMat& src2, MetalMat& dst, Stream& stre
 
     dst.create(src1.size(), src1.type());
 
+    // MPS operations require command buffer reference - get fresh one each time
     id<MTLCommandBuffer> commandBuffer = StreamAccessor::getCommandBuffer(stream);
     CV_Assert(commandBuffer != nil);
 
