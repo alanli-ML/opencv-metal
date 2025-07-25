@@ -289,6 +289,48 @@ kernel void argminAndAssign(
     
     labels[tid] = bestLabel;
 }
+
+// GPU Component Assignment kernel for GrabCut optimization
+// Replaces CPU pixel-by-pixel loops with GPU parallel processing
+kernel void assignComponentsKernel(
+    texture2d<uint, access::read>   mask [[texture(0)]],        // GrabCut mask (GC_BGD, GC_FGD, etc.)
+    texture2d<int, access::read>    bgLabels [[texture(1)]],    // Background k-means labels
+    texture2d<int, access::read>    fgLabels [[texture(2)]],    // Foreground k-means labels
+    texture2d<uint, access::write>  compIdxs [[texture(3)]],    // Output component assignments
+    uint2 gid [[thread_position_in_grid]])
+{
+    // Check bounds
+    if (gid.x >= mask.get_width() || gid.y >= mask.get_height()) {
+        return;
+    }
+    
+    // Read mask value to determine background vs foreground
+    uint maskValue = mask.read(gid).x;
+    
+    // GrabCut mask values:
+    // 0 = GC_BGD (certain background)
+    // 1 = GC_FGD (certain foreground) 
+    // 2 = GC_PR_BGD (probably background)
+    // 3 = GC_PR_FGD (probably foreground)
+    
+    int component = 0;
+    
+    // Background pixels (GC_BGD = 0 or GC_PR_BGD = 2)
+    if (maskValue == 0 || maskValue == 2) {
+        component = bgLabels.read(gid).x;
+    }
+    // Foreground pixels (GC_FGD = 1 or GC_PR_FGD = 3)
+    else if (maskValue == 1 || maskValue == 3) {
+        component = fgLabels.read(gid).x;
+    }
+    
+    // Ensure component is in valid range [0, 4] (5 components per class)
+    component = clamp(component, 0, 4);
+    
+    // Write component assignment - always 0-4 for both BG and FG
+    // (mask value determines which GMM to use, not the component index)
+    compIdxs.write(uint(component), gid);
+}
 )";
 
 // Pipeline state cache using dispatch_once pattern
@@ -525,6 +567,41 @@ static id<MTLComputePipelineState> getArgminAndAssignPipeline() {
             id<MTLFunction> function = [library newFunctionWithName:@"argminAndAssign"];
             if (!function) {
                 CV_Error(Error::StsError, "Failed to create argminAndAssign function");
+                return;
+            }
+            
+            pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+            if (error) {
+                CV_Error(Error::StsError, [[error localizedDescription] UTF8String]);
+            }
+        }
+    });
+    
+    return pipeline;
+}
+
+static id<MTLComputePipelineState> getAssignComponentsPipeline() {
+    static id<MTLComputePipelineState> pipeline = nil;
+    static dispatch_once_t onceToken;
+    
+    dispatch_once(&onceToken, ^{
+        @autoreleasepool {
+            id<MTLDevice> device = MetalContext::getInstance().device;
+            NSError *error = nil;
+            
+            NSString *kernelSource = [NSString stringWithCString:kmeansShaderSource 
+                                                        encoding:NSUTF8StringEncoding];
+            id<MTLLibrary> library = [device newLibraryWithSource:kernelSource 
+                                                          options:nil error:&error];
+            
+            if (error) {
+                CV_Error(Error::StsError, [[error localizedDescription] UTF8String]);
+                return;
+            }
+            
+            id<MTLFunction> function = [library newFunctionWithName:@"assignComponentsKernel"];
+            if (!function) {
+                CV_Error(Error::StsError, "Failed to create assignComponentsKernel function");
                 return;
             }
             
@@ -1555,6 +1632,46 @@ void kmeansClusterByMask(const MetalMat& inImg, const MetalMat& mask, bool useBa
         centroids.at<float>(i, 1) = centroidsPtr[i * 3 + 1] * 255.0f;  // G
         centroids.at<float>(i, 2) = centroidsPtr[i * 3 + 2] * 255.0f;  // R
     }
+}
+
+// GPU Component Assignment for GrabCut optimization (Phase 1.3)
+void assignComponents(const MetalMat& mask, const MetalMat& bgLabels, const MetalMat& fgLabels, 
+                     MetalMat& compIdxs, Stream& stream) {
+    CV_Assert(!mask.empty());
+    CV_Assert(!bgLabels.empty());
+    CV_Assert(!fgLabels.empty());
+    CV_Assert(mask.size() == bgLabels.size());
+    CV_Assert(mask.size() == fgLabels.size());
+    CV_Assert(mask.type() == CV_8UC1);
+    CV_Assert(bgLabels.type() == CV_32SC1);
+    CV_Assert(fgLabels.type() == CV_32SC1);
+    
+    // Create output texture for component assignments
+    compIdxs.create(mask.size(), CV_8UC1);
+    
+    // Get pipeline
+    id<MTLComputePipelineState> pipeline = getAssignComponentsPipeline();
+    if (!pipeline) {
+        CV_Error(Error::StsError, "Failed to get assignComponents pipeline");
+    }
+    
+    // Encode GPU component assignment kernel
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = StreamAccessor::createComputeEncoder(stream);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setTexture:mask.texture() atIndex:0];      // GrabCut mask
+        [encoder setTexture:bgLabels.texture() atIndex:1];  // Background k-means labels  
+        [encoder setTexture:fgLabels.texture() atIndex:2];  // Foreground k-means labels
+        [encoder setTexture:compIdxs.texture() atIndex:3];  // Output component assignments
+        
+        // Dispatch with 16x16 thread groups
+        MTLSize gridSize = MTLSizeMake((mask.cols() + 15) / 16, (mask.rows() + 15) / 16, 1);
+        MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
+        [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
+        [encoder endEncoding];
+    }
+    
+    // Note: No sync/commit here - caller manages stream lifecycle
 }
 
 }} // namespace cv::metal
