@@ -581,6 +581,301 @@ TEST(MetalImgproc_GrabCut, SyncPointAnalysis)
     std::cout << "Priority 3: Optimize CPU graph construction to avoid downloads" << std::endl;
 }
 
+// GPU vs CPU K-means Performance Comparison Test
+TEST(MetalImgproc_KMeans, GPUvsCPUPerformanceComparison)
+{
+    // CPU implementation of mask-based K-means for comparison
+    auto cpuKmeansClusterByMask = [](const cv::Mat& inImg, const cv::Mat& mask, bool useBackground,
+                                    cv::Mat& outLabels, cv::Mat& centroids) -> double {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        const int K = 5;
+        const int maxIterations = 10;
+        const float epsilon = 1.0f;
+        
+        // Collect valid pixels
+        std::vector<cv::Point> validPixels;
+        std::vector<cv::Vec3f> validColors;
+        
+        for (int y = 0; y < mask.rows; y++) {
+            for (int x = 0; x < mask.cols; x++) {
+                uchar maskVal = mask.at<uchar>(y, x);
+                bool isBackground = (maskVal == 0 || maskVal == 2);
+                if (isBackground == useBackground) {
+                    validPixels.push_back(cv::Point(x, y));
+                    cv::Vec4b pixel = inImg.at<cv::Vec4b>(y, x);
+                    validColors.push_back(cv::Vec3f(pixel[0], pixel[1], pixel[2])); // BGR
+                }
+            }
+        }
+        
+        if (validPixels.size() < K) {
+            throw std::runtime_error("Not enough valid pixels for k-means");
+        }
+        
+        // Initialize centroids randomly within bounding box (same as GPU)
+        cv::Vec2f bbox[3]; // [min, max] for BGR
+        bbox[0] = bbox[1] = bbox[2] = cv::Vec2f(validColors[0][0], validColors[0][0]);
+        
+        for (const auto& color : validColors) {
+            for (int c = 0; c < 3; c++) {
+                bbox[c][0] = std::min(bbox[c][0], color[c]);
+                bbox[c][1] = std::max(bbox[c][1], color[c]);
+            }
+        }
+        
+        std::vector<cv::Vec3f> centers(K);
+        cv::RNG& rng = cv::theRNG();
+        const float margin = 1.0f / 3.0f;
+        
+        for (int i = 0; i < K; i++) {
+            for (int c = 0; c < 3; c++) {
+                centers[i][c] = ((float)rng * (1.0f + margin * 2.0f) - margin) * 
+                               (bbox[c][1] - bbox[c][0]) + bbox[c][0];
+            }
+        }
+        
+        std::vector<int> labels(validPixels.size());
+        
+        // Main k-means loop
+        for (int iter = 0; iter < maxIterations; iter++) {
+            // Assignment step
+            for (size_t i = 0; i < validColors.size(); i++) {
+                float minDist = FLT_MAX;
+                int bestLabel = 0;
+                
+                for (int k = 0; k < K; k++) {
+                    cv::Vec3f diff = validColors[i] - centers[k];
+                    float dist = diff.dot(diff);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        bestLabel = k;
+                    }
+                }
+                labels[i] = bestLabel;
+            }
+            
+            // Update centroids
+            std::vector<cv::Vec3f> newCenters(K, cv::Vec3f(0, 0, 0));
+            std::vector<int> counts(K, 0);
+            
+            for (size_t i = 0; i < validColors.size(); i++) {
+                int label = labels[i];
+                newCenters[label] += validColors[i];
+                counts[label]++;
+            }
+            
+            for (int k = 0; k < K; k++) {
+                if (counts[k] > 0) {
+                    newCenters[k] /= (float)counts[k];
+                } else {
+                    newCenters[k] = centers[k]; // Keep old center if no points assigned
+                }
+            }
+            
+            centers = newCenters;
+        }
+        
+        // Create output labels matrix
+        outLabels.create(inImg.size(), CV_32SC1);
+        outLabels.setTo(-1); // Initialize with invalid label
+        
+        for (size_t i = 0; i < validPixels.size(); i++) {
+            cv::Point pt = validPixels[i];
+            outLabels.at<int>(pt.y, pt.x) = labels[i];
+        }
+        
+        // Create output centroids
+        centroids.create(K, 3, CV_32F);
+        for (int k = 0; k < K; k++) {
+            centroids.at<float>(k, 0) = centers[k][0]; // B
+            centroids.at<float>(k, 1) = centers[k][1]; // G  
+            centroids.at<float>(k, 2) = centers[k][2]; // R
+        }
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    };
+
+    std::cout << "\n=== K-MEANS CLUSTERING PERFORMANCE COMPARISON ===\n" << std::endl;
+
+    // Create synthetic test image (more reliable than depending on external files)
+    const int width = 2560, height = 1440; // Test with larger QHD image
+    cv::Mat img(height, width, CV_8UC3);
+    
+    // Create a realistic synthetic image with distinct regions
+    cv::Scalar bgColor(50, 100, 150);   // Blue-ish background
+    cv::Scalar fgColor(200, 150, 100);  // Orange-ish foreground
+    cv::Scalar noise(30, 30, 30);       // Noise amplitude
+    
+    cv::RNG rng(42); // Fixed seed for reproducibility
+    img.setTo(bgColor);
+    
+    // Add background noise
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            cv::Vec3b& pixel = img.at<cv::Vec3b>(y, x);
+            for (int c = 0; c < 3; c++) {
+                int noiseVal = rng.uniform(-noise[c], noise[c]);
+                pixel[c] = cv::saturate_cast<uchar>(pixel[c] + noiseVal);
+            }
+        }
+    }
+    
+    // Add foreground region in center
+    cv::Rect fgRect(width/4, height/4, width/2, height/2);
+    cv::Mat fgRegion = img(fgRect);
+    fgRegion.setTo(fgColor);
+    
+    // Add foreground noise
+    for (int y = 0; y < fgRegion.rows; y++) {
+        for (int x = 0; x < fgRegion.cols; x++) {
+            cv::Vec3b& pixel = fgRegion.at<cv::Vec3b>(y, x);
+            for (int c = 0; c < 3; c++) {
+                int noiseVal = rng.uniform(-noise[c], noise[c]);
+                pixel[c] = cv::saturate_cast<uchar>(pixel[c] + noiseVal);
+            }
+        }
+    }
+    
+    std::cout << "Synthetic test image created: " << img.cols << "x" << img.rows << " pixels" << std::endl;
+    
+    // Create GrabCut-like mask (center rectangle as foreground, rest as background)
+    cv::Mat mask = cv::Mat::zeros(img.size(), CV_8UC1);
+    cv::Rect rect(img.cols/4, img.rows/4, img.cols/2, img.rows/2);
+    mask(rect).setTo(cv::GC_PR_FGD);
+    mask.row(0).setTo(cv::GC_BGD);
+    mask.row(mask.rows-1).setTo(cv::GC_BGD);
+    mask.col(0).setTo(cv::GC_BGD);
+    mask.col(mask.cols-1).setTo(cv::GC_BGD);
+    
+    // Convert image to BGRA for Metal
+    cv::Mat imgBGRA;
+    cv::cvtColor(img, imgBGRA, cv::COLOR_BGR2BGRA);
+    
+    // Test multiple runs for reliable timing
+    const int numRuns = 5;
+    
+    // Background clustering comparison
+    std::cout << "\n--- Background Pixel Clustering (K=5) ---" << std::endl;
+    
+    double gpuBgTime = 0, cpuBgTime = 0;
+    cv::Mat gpuBgCentroids, cpuBgCentroids;
+    cv::metal::MetalMat gpuBgLabels;
+    cv::Mat cpuBgLabels;
+    
+    // Set fixed seed for reproducible results
+    cv::theRNG().state = 42;
+    
+    for (int run = 0; run < numRuns; run++) {
+        // Reset RNG state for fair comparison
+        cv::theRNG().state = 42 + run;
+        
+        // GPU test
+        {
+            cv::metal::Stream stream;
+            cv::metal::MetalMat metalImg, metalMask;
+            metalImg.upload(imgBGRA);
+            metalMask.upload(mask);
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            cv::metal::kmeansClusterByMask(metalImg, metalMask, true, gpuBgLabels, gpuBgCentroids, stream);
+            stream.syncCPU();
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            gpuBgTime += std::chrono::duration<double, std::milli>(end - start).count();
+        }
+        
+        // CPU test
+        cv::theRNG().state = 42 + run; // Reset to same seed
+        cpuBgTime += cpuKmeansClusterByMask(imgBGRA, mask, true, cpuBgLabels, cpuBgCentroids);
+    }
+    
+    gpuBgTime /= numRuns;
+    cpuBgTime /= numRuns;
+    
+    std::cout << "GPU Background K-means: " << std::fixed << std::setprecision(1) << gpuBgTime << " ms" << std::endl;
+    std::cout << "CPU Background K-means: " << std::fixed << std::setprecision(1) << cpuBgTime << " ms" << std::endl;
+    std::cout << "Background Speedup: " << std::fixed << std::setprecision(2) << (cpuBgTime / gpuBgTime) << "x" << std::endl;
+    
+    // Foreground clustering comparison  
+    std::cout << "\n--- Foreground Pixel Clustering (K=5) ---" << std::endl;
+    
+    double gpuFgTime = 0, cpuFgTime = 0;
+    cv::Mat gpuFgCentroids, cpuFgCentroids;
+    cv::metal::MetalMat gpuFgLabels;
+    cv::Mat cpuFgLabels;
+    
+    for (int run = 0; run < numRuns; run++) {
+        // Reset RNG state for fair comparison
+        cv::theRNG().state = 42 + run;
+        
+        // GPU test
+        {
+            cv::metal::Stream stream;
+            cv::metal::MetalMat metalImg, metalMask;
+            metalImg.upload(imgBGRA);
+            metalMask.upload(mask);
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            cv::metal::kmeansClusterByMask(metalImg, metalMask, false, gpuFgLabels, gpuFgCentroids, stream);
+            stream.syncCPU();
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            gpuFgTime += std::chrono::duration<double, std::milli>(end - start).count();
+        }
+        
+        // CPU test
+        cv::theRNG().state = 42 + run; // Reset to same seed
+        cpuFgTime += cpuKmeansClusterByMask(imgBGRA, mask, false, cpuFgLabels, cpuFgCentroids);
+    }
+    
+    gpuFgTime /= numRuns;
+    cpuFgTime /= numRuns;
+    
+    std::cout << "GPU Foreground K-means: " << std::fixed << std::setprecision(1) << gpuFgTime << " ms" << std::endl;
+    std::cout << "CPU Foreground K-means: " << std::fixed << std::setprecision(1) << cpuFgTime << " ms" << std::endl;
+    std::cout << "Foreground Speedup: " << std::fixed << std::setprecision(2) << (cpuFgTime / gpuFgTime) << "x" << std::endl;
+    
+    // Overall comparison
+    double totalGpuTime = gpuBgTime + gpuFgTime;
+    double totalCpuTime = cpuBgTime + cpuFgTime;
+    
+    std::cout << "\n--- Overall K-means Performance ---" << std::endl;
+    std::cout << "Total GPU Time: " << std::fixed << std::setprecision(1) << totalGpuTime << " ms" << std::endl;
+    std::cout << "Total CPU Time: " << std::fixed << std::setprecision(1) << totalCpuTime << " ms" << std::endl;
+    std::cout << "Overall K-means Speedup: " << std::fixed << std::setprecision(2) << (totalCpuTime / totalGpuTime) << "x" << std::endl;
+    
+    // Data processing analysis
+    int bgPixels = cv::countNonZero(mask == cv::GC_BGD) + cv::countNonZero(mask == cv::GC_PR_BGD);
+    int fgPixels = cv::countNonZero(mask == cv::GC_FGD) + cv::countNonZero(mask == cv::GC_PR_FGD);
+    
+    std::cout << "\n--- Processing Analysis ---" << std::endl;
+    std::cout << "Background pixels: " << bgPixels << std::endl;
+    std::cout << "Foreground pixels: " << fgPixels << std::endl;
+    std::cout << "GPU Throughput: " << std::fixed << std::setprecision(1) 
+              << ((bgPixels + fgPixels) / totalGpuTime) << " pixels/ms" << std::endl;
+    std::cout << "CPU Throughput: " << std::fixed << std::setprecision(1) 
+              << ((bgPixels + fgPixels) / totalCpuTime) << " pixels/ms" << std::endl;
+    
+    // Validation: centroids should be reasonable
+    EXPECT_FALSE(gpuBgCentroids.empty());
+    EXPECT_FALSE(gpuFgCentroids.empty());
+    EXPECT_EQ(gpuBgCentroids.rows, 5);
+    EXPECT_EQ(gpuFgCentroids.rows, 5);
+    EXPECT_EQ(gpuBgCentroids.cols, 3);
+    EXPECT_EQ(gpuFgCentroids.cols, 3);
+    
+    // Check if GPU is actually faster
+    if (totalGpuTime < totalCpuTime) {
+        std::cout << "✅ GPU K-means is faster than CPU!" << std::endl;
+    } else {
+        std::cout << "⚠️  CPU K-means is faster - GPU optimization may need improvement" << std::endl;
+    }
+    
+    std::cout << "\n=== K-MEANS PERFORMANCE TEST COMPLETE ===\n" << std::endl;
+}
+
 } // namespace
 } // namespace opencv_test
 

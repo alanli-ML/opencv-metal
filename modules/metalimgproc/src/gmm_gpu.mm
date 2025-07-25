@@ -66,10 +66,6 @@ void GMM::learnGMMsGPU(const MetalMat& image, const MetalMat& mask, const MetalM
         [encoder endEncoding];
     }
     
-    // CRITICAL: Need to sync here to read statistics for component total calculations
-    stream.syncCPU();
-    float* bgStats = (float*)[m_bgStatsBuffer contents];
-    float* fgStats = (float*)[m_fgStatsBuffer contents];
     
     // PHASE 2: Count total pixels on GPU
     @autoreleasepool {
