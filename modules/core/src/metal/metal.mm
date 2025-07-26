@@ -5,7 +5,6 @@
 #include "../precomp.hpp"
 #include "metal_precomp.hpp"
 #include "metal_wrapper.hpp"
-// Removed imgproc dependency to avoid circular dependency
 
 // This file will be populated with Objective-C++ code.
 // The .mm extension allows mixing C++ and Objective-C.

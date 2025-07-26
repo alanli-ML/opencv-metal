@@ -14,23 +14,6 @@ double kmeans(const MetalMat& data, int K, MetalMat& bestLabels,
 
 }} // end cv::metal namespace temporarily
 
-// Forward declaration for the enhanced Metal function
-namespace cv { namespace metal {
-void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compIdxs, 
-                       bool useMetalKMeans = false, uint64_t seed = 0, Stream* stream = nullptr);
-}} // cv::metal
-
-namespace cv { namespace metal {
-
-// Removed unused kmeansComponentMap function
-
-// PHASE 3 OPTIMIZATION: Enable full-GPU graph-cut solver
-// This eliminates massive CPU-GPU data transfers in the iterative loop
-// Now controlled by runtime parameter instead of compile-time flag
-
-}} // end cv::metal namespace temporarily for CPU helper functions
-
-// (Removed unused extern enableCPUKMeansMode)
 
 namespace cv { namespace metal {
 
@@ -48,7 +31,6 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
     
     if (useMetalKMeans && stream) {
         // METAL PATH: Use direct mask-based k-means without intermediate samples
-        printf("=== USING METAL K-MEANS INITIALIZATION ===\n");
         try {
             // Convert input image to BGRA format for Metal
             cv::Mat imgBGRA;
@@ -85,123 +67,14 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
             // Download only the final component assignments (much smaller than k-means labels)
             metalComponents.download(compIdxs, *stream, true);
             
-            // Optional: Count component assignments for debugging (if needed)
-            std::vector<int> metalBgComponentCounts(componentsCount, 0);
-            std::vector<int> metalFgComponentCounts(componentsCount, 0);
-            
-            // Count assignments from the GPU result (optional debug validation)
-            cv::Point p;
-            for (p.y = 0; p.y < compIdxs.rows; p.y++) {
-                for (p.x = 0; p.x < compIdxs.cols; p.x++) {
-                    uchar maskVal = mask.at<uchar>(p);
-                    uchar component = compIdxs.at<uchar>(p);
-                    
-                    if (maskVal == cv::GC_BGD || maskVal == cv::GC_PR_BGD) {
-                        metalBgComponentCounts[component]++;
-                    } else if (maskVal == cv::GC_FGD || maskVal == cv::GC_PR_FGD) {
-                        metalFgComponentCounts[component]++;
-                    }
-                }
-            }
-            
-            // VALIDATION: Check for potential data issues
-            int totalBgPixels = 0, totalFgPixels = 0;
-            int actualBgPixels = 0, actualFgPixels = 0;
-            for (int y = 0; y < img.rows; y++) {
-                for (int x = 0; x < img.cols; x++) {
-                    uchar maskVal = mask.at<uchar>(y, x);
-                    if (maskVal == cv::GC_BGD || maskVal == cv::GC_PR_BGD) {
-                        actualBgPixels++;
-                    } else if (maskVal == cv::GC_FGD || maskVal == cv::GC_PR_FGD) {
-                        actualFgPixels++;
-                    }
-                }
-            }
-            
-            for (int i = 0; i < componentsCount; i++) {
-                totalBgPixels += metalBgComponentCounts[i];
-                totalFgPixels += metalFgComponentCounts[i];
-            }
-            
-            // Debug: Print component assignment statistics with validation
-            printf("=== METAL K-MEANS COMPONENT ASSIGNMENT (FIXED) ===\n");
-            printf("Background: %d actual pixels, %d assigned to components\n", actualBgPixels, totalBgPixels);
-            for (int i = 0; i < componentsCount; i++) {
-                printf("  Component %d: %d pixels\n", i, metalBgComponentCounts[i]);
-            }
-            printf("Foreground: %d actual pixels, %d assigned to components\n", actualFgPixels, totalFgPixels);
-            for (int i = 0; i < componentsCount; i++) {
-                printf("  Component %d: %d pixels\n", i, metalFgComponentCounts[i]);
-            }
-            
-            // VALIDATION: Verify all pixels are accounted for
-            if (totalBgPixels != actualBgPixels) {
-                printf("WARNING: Background pixel count mismatch! Expected %d, got %d\n", actualBgPixels, totalBgPixels);
-            }
-            if (totalFgPixels != actualFgPixels) {
-                printf("WARNING: Foreground pixel count mismatch! Expected %d, got %d\n", actualFgPixels, totalFgPixels);
-            }
-            
-            // Debug: Print centroids
-            printf("Background centroids (BGR, [0-255]):\n");
-            if (!bgCentroids.empty()) {
-                for (int i = 0; i < componentsCount; i++) {
-                    printf("  Centroid %d: (%.1f, %.1f, %.1f)\n", i,
-                           bgCentroids.at<float>(i, 0), bgCentroids.at<float>(i, 1), bgCentroids.at<float>(i, 2));
-                }
-            } else {
-                printf("  (centroids empty)\n");
-            }
-            printf("Foreground centroids (BGR, [0-255]):\n");
-            if (!fgCentroids.empty()) {
-                for (int i = 0; i < componentsCount; i++) {
-                    printf("  Centroid %d: (%.1f, %.1f, %.1f)\n", i,
-                           fgCentroids.at<float>(i, 0), fgCentroids.at<float>(i, 1), fgCentroids.at<float>(i, 2));
-                }
-            } else {
-                printf("  (centroids empty)\n");
-            }
-            
-            // Check for uninitialized pixels
-            int uninitializedCount = 0;
-            for (int y = 0; y < compIdxs.rows; y++) {
-                for (int x = 0; x < compIdxs.cols; x++) {
-                    uchar maskVal = mask.at<uchar>(y, x);
-                    uchar compVal = compIdxs.at<uchar>(y, x);
-                    if (maskVal <= 3 && compVal > 4) {
-                        uninitializedCount++;
-                    }
-                }
-            }
-            printf("Uninitialized pixels: %d\n", uninitializedCount);
-            
-            // Debug: Show actual component values for some pixels
-            printf("\nSample component assignments after k-means:\n");
-            int sampleCount = 0;
-            for (int y = 0; y < compIdxs.rows && sampleCount < 20; y += compIdxs.rows / 5) {
-                for (int x = 0; x < compIdxs.cols && sampleCount < 20; x += compIdxs.cols / 5) {
-                    uchar maskVal = mask.at<uchar>(y, x);
-                    uchar compVal = compIdxs.at<uchar>(y, x);
-                    const char* maskType = (maskVal == cv::GC_BGD) ? "BGD" : 
-                                         (maskVal == cv::GC_FGD) ? "FGD" :
-                                         (maskVal == cv::GC_PR_BGD) ? "PR_BGD" : "PR_FGD";
-                    printf("  (%d,%d): mask=%s, component=%d\n", x, y, maskType, (int)compVal);
-                    sampleCount++;
-                }
-            }
-            
-            printf("==========================================\n");
-            
             return; // Success - exit early
             
         } catch (const cv::Exception& e) {
-            printf("Metal K-means failed: %s\n", e.what());
             // Fall through to CPU implementation
         }
     }
     
     // CPU PATH: Traditional sample-based approach (fallback or when Metal disabled)
-    printf("=== USING CPU K-MEANS INITIALIZATION (useMetalKMeans=%d, stream=%p) ===\n", useMetalKMeans, stream);
     
     cv::Mat bgdLabels, fgdLabels;
     std::vector<cv::Vec3f> bgdSamples, fgdSamples;
@@ -538,19 +411,6 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         
         m_gmm->assignGMMs(image, mask, m_components, stream);
         
-        // DEBUG: Print mask values after assignment in each iteration
-        {
-            stream.syncCPU();
-            Mat h_mask;
-            mask.download(h_mask, stream, true);
-            printf("[GrabCut DEBUG iter %d] Mask at (102,192): %u, (204,192): %u\n",
-                   iter, h_mask.at<uchar>(192, 102), h_mask.at<uchar>(192, 204));
-        }
-        
-        // DETAILED TRACKING: Show component assignments after assignment
-        
-        // Sample a few component assignments
-        
         // Learn GMM parameters (except in freeze model mode)  
         if (mode != GC_EVAL_FREEZE_MODEL) {
             m_gmm->learnGMMs(image, mask, m_components, stream);
@@ -565,10 +425,6 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         // Compute unary potentials (data term) - still on same stream
         m_gmm->computeDataTerm(image, mask, m_bgTerm, m_fgTerm, stream);
         
-        // DEBUG: Force synchronization to ensure unary terms are written before graph construction.
-        // If this fixes negative initial excess, it points to a race condition.
-        stream.syncCPU();
-
         if (useGpuGraphCut) {
             // ---------------------------------------------------------------------------------
             // FULL-GPU PATH
@@ -580,13 +436,6 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
             }
 
             // Build the graph directly on the GPU from unary & pairwise terms
-            {
-                stream.syncCPU();
-                Mat h_mask;
-                mask.download(h_mask, stream, true);
-                printf("[GrabCut DEBUG pre-buildGraph] Mask at (102,192): %u, (204,192): %u\n",
-                       h_mask.at<uchar>(192, 102), h_mask.at<uchar>(192, 204));
-            }
             m_metalGraphCut->buildGraph(m_bgTerm, m_fgTerm,
                                         m_pairwiseWeights[0], m_pairwiseWeights[2],
                                         m_pairwiseWeights[1], m_pairwiseWeights[3],
@@ -679,29 +528,16 @@ void GrabCutImpl::constructGCGraph(const MetalMat& image, const MetalMat& mask,
     graph.create(vtxCount, edgeCount);
     
     // Construct graph on CPU (following OpenCV's implementation)
-    int probableDebugCount = 0;
-    int totalProbablePixels = 0;
-    int totalSurePixels = 0;
     for (int y = 0; y < image.rows(); y++) {
         for (int x = 0; x < image.cols(); x++) {
             int vtxIdx = graph.addVtx();
             uchar maskValue = h_mask.at<uchar>(y, x);
-            
-            if (maskValue == GC_PR_BGD || maskValue == GC_PR_FGD) {
-                totalProbablePixels++;
-            } else {
-                totalSurePixels++;
-            }
             
             // Set terminal weights (unary potentials)
             double fromSource, toSink;
             if (maskValue == GC_PR_BGD || maskValue == GC_PR_FGD) {
                 fromSource = h_bgTerm.at<float>(y, x);      // Cost to connect to SOURCE (background model cost, like CPU)
                 toSink = h_fgTerm.at<float>(y, x);          // Cost to connect to SINK (foreground model cost, like CPU)
-                // Debug: sample some terminal weights
-                if (probableDebugCount < 5) {
-                    probableDebugCount++;
-                }
             } else { // GC_BGD or GC_FGD
                 if (maskValue == GC_BGD) {
                     fromSource = 0;
@@ -736,9 +572,6 @@ void GrabCutImpl::constructGCGraph(const MetalMat& image, const MetalMat& mask,
             }
         }
     }
-    
-    if (probableDebugCount == 0) {
-    }
 }
 
 void GrabCutImpl::estimateSegmentation(cv::detail::GCGraph<double>& graph, MetalMat& mask, Stream& stream) {
@@ -751,53 +584,37 @@ void GrabCutImpl::estimateSegmentation(cv::detail::GCGraph<double>& graph, Metal
     mask.download(h_currentMask, stream, true);
     
     // Convert from Metal texture format back to GrabCut mask values
-    // Metal stores: 0.0, 0.33, 0.67, 1.0 → CV_8UC1: 0, 84, 171, 255
-    // Need to convert to: 0, 1, 2, 3 (GrabCut mask values)
-    int valueCount[256] = {0};
-    int grabcutCounts[4] = {0}; // Count GrabCut values after conversion
+    // Metal stores GrabCut values directly as discrete integers [0,1,2,3]
     for (int y = 0; y < h_currentMask.rows; y++) {
         for (int x = 0; x < h_currentMask.cols; x++) {
             uchar metalValue = h_currentMask.at<uchar>(y, x);
-            valueCount[metalValue]++;
             // Metal stores GrabCut values directly as discrete integers [0,1,2,3]
             uchar grabcutValue = metalValue;
             if (grabcutValue <= 3) { // Valid GrabCut values
-                grabcutCounts[grabcutValue]++;
                 h_currentMask.at<uchar>(y, x) = grabcutValue;
             } else {
                 // Invalid value, default to background
-                grabcutCounts[0]++;
                 h_currentMask.at<uchar>(y, x) = 0;
             }
         }
     }
     
-    // Debug: show what values we actually downloaded from Metal
-    
     // Update mask based on graph cut results
-    int fgDecisions = 0, bgDecisions = 0, totalProbable = 0;
-    int checkedPixels = 0;
     for (int y = 0; y < mask.rows(); y++) {
         for (int x = 0; x < mask.cols(); x++) {
             uchar currentValue = h_currentMask.at<uchar>(y, x);
             if (currentValue == GC_PR_BGD || currentValue == GC_PR_FGD) {
-                totalProbable++;
                 int vtxIdx = y * mask.cols() + x;
                 if (graph.inSourceSegment(vtxIdx)) {
                     h_mask.at<uchar>(y, x) = GC_PR_FGD;
-                    fgDecisions++;
                 } else {
                     h_mask.at<uchar>(y, x) = GC_PR_BGD;
-                    bgDecisions++;
                 }
-                checkedPixels++;
             } else {
                 h_mask.at<uchar>(y, x) = currentValue; // Keep sure pixels unchanged
             }
         }
     }
-    
-
     
     // Convert GrabCut mask values back to Metal texture format before upload
     Mat h_metalMask(mask.size(), CV_8UC1);
@@ -834,12 +651,6 @@ void grabCut(InputArray _img, InputOutputArray _mask, Rect rect,
     Mat& mask = _mask.getMatRef();
     Mat& bgdModel = _bgdModel.getMatRef();
     Mat& fgdModel = _fgdModel.getMatRef();
-    
-    // DEBUG: Print initial mask values for specific pixels
-    if (!mask.empty()) {
-        printf("[GrabCut DEBUG] Initial mask value at (102,192): %u\n", mask.at<uchar>(192, 102));
-        printf("[GrabCut DEBUG] Initial mask value at (204,192): %u\n", mask.at<uchar>(192, 204));
-    }
     
     // Convert BGR to BGRA for Metal processing
     Mat imgBGRA;
@@ -970,65 +781,6 @@ void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
     Stream defaultStream;
     grabCutWithSharedKMeans(img, mask, rect, bgdModel, fgdModel, iterCount, mode, randomSeed, useGpuGraphCut, defaultStream);
     defaultStream.commitAndWait();
-}
-
-void grabCut_debug(InputArray _img, InputOutputArray _mask, Rect rect,
-                   cv::Mat& _bg_unary, cv::Mat& _fg_unary, Stream& stream)
-{
-    // Create a custom implementation to intercept unary terms
-    cv::Mat bgdModel = cv::Mat::zeros(1, 65, CV_64FC1);
-    cv::Mat fgdModel = cv::Mat::zeros(1, 65, CV_64FC1);
-    
-    // Initialize mask
-    _mask.create(_img.size(), CV_8UC1);
-    
-    // Create a GrabCutImpl instance to access internal methods
-    GrabCutImpl impl;
-    
-    MetalMat metal_img, metal_mask, metal_bgdModel, metal_fgdModel;
-    metal_img.upload(_img.getMat());
-    metal_mask.upload(_mask.getMat());
-    metal_bgdModel.upload(bgdModel);
-    metal_fgdModel.upload(fgdModel);
-    
-    // Run the implementation to build the graph and access unary terms
-    impl.run(metal_img, metal_mask, rect, metal_bgdModel, metal_fgdModel, 1, GC_INIT_WITH_RECT, true, stream);
-    
-    // Get the solver to access terminal flow buffer
-    const MetalGraphCut& solver = impl.getGraphCutSolver();
-    id<MTLBuffer> termBuffer = solver.getTerminalFlowBuffer();
-    
-    // Create output matrices
-    _bg_unary.create(_img.rows(), _img.cols(), CV_32FC1);
-    _fg_unary.create(_img.rows(), _img.cols(), CV_32FC1);
-    
-    if (termBuffer != nil) {
-        // Define the structure to match the GPU buffer
-        typedef struct {
-            float to_source; // foreground unary (capacity to source)
-            float to_sink;   // background unary (capacity to sink)
-        } TerminalFlow;
-        
-        // Access the buffer data
-        TerminalFlow* termData = (TerminalFlow*)[termBuffer contents];
-        int width = _img.cols();
-        int height = _img.rows();
-        
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int idx = y * width + x;
-                _bg_unary.at<float>(y, x) = termData[idx].to_sink;
-                _fg_unary.at<float>(y, x) = termData[idx].to_source;
-            }
-        }
-    } else {
-        // Fallback if buffer access fails
-        _bg_unary.setTo(-1.0f);  // Use -1 to indicate failure
-        _fg_unary.setTo(-1.0f);
-    }
-    
-    // Download the final mask
-    metal_mask.download(_mask.getMatRef(), stream, true);
 }
 
 }} // cv::metal

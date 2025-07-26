@@ -58,11 +58,6 @@ public:
      * MetalMat of type CV_8UC1 and same spatial dimensions as the image.
      */
     void getSegmentation(MetalMat& mask, const MetalMat& initial_mask);
-    
-    /**
-     * Debug access to terminal flow buffer for unary term analysis.
-     */
-    id<MTLBuffer> getTerminalFlowBuffer() const { return m_terminalFlow; }
 
 private:
     // We deliberately keep the member list minimal for now – additional GPU
@@ -70,14 +65,8 @@ private:
     Stream&         m_stream;
     cv::Size        m_graphSize;
 
-    // Keep references to unary term textures for a simple provisional segmentation pass.
-    id              m_bgTermTex = nil;
-    id              m_fgTermTex = nil;
-
     // --- Buffers for upcoming push-relabel implementation ---
-    id<MTLBuffer> m_nodeData      = nil; // excess + label
     id<MTLBuffer> m_terminalFlow  = nil; // source/sink capacities
-    id<MTLBuffer> m_residualCap   = nil; // float4 neighbour capacities (left, top-left, top, top-right)
 
     // BFS traversal buffers / Active Lists (ping-pong)
     id<MTLBuffer> m_activeList1    = nil;
@@ -95,6 +84,10 @@ private:
     // --- Atomics refactor buffers (slice 1) ---
     id<MTLBuffer> m_nodeDataAtom   = nil; // NodeDataAtom array (atomic excess+label)
     id<MTLBuffer> m_residualAtom   = nil; // Residual4Atom array (atomic neighbour caps)
+
+    // Texture references for provisional segmentation
+    id<MTLTexture> m_bgTermTex = nil;
+    id<MTLTexture> m_fgTermTex = nil;
 
     // Allocation helper
     void allocateGraphBuffers();
