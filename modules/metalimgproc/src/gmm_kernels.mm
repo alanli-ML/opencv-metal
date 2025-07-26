@@ -198,7 +198,7 @@ kernel void gmmAssignKernel(texture2d<float, access::sample> image [[texture(0)]
     components.write(uint(best_component), gid);
     
     // DEBUG: Sample component assignments to verify they're in range 0-4
-    if ((gid.x == 500 && gid.y >= 373 && gid.y <= 382) || (gid.x >= 13 && gid.x <= 20 && gid.y == 0)) {
+    if ((gid.x == 102 && gid.y == 192) || (gid.x == 204 && gid.y == 192)) { // Check known probable foreground pixels
         // For debugging specific pixels - do nothing here to avoid Metal print limitations
         // Debug output will be checked via CPU download
     }
@@ -206,7 +206,7 @@ kernel void gmmAssignKernel(texture2d<float, access::sample> image [[texture(0)]
 
 // Compute data term (unary potentials) kernel
 kernel void gmmDataTermKernel(texture2d<float, access::sample> image [[texture(0)]],
-                             texture2d<float, access::read> mask [[texture(1)]],
+                             texture2d<uint, access::read> mask [[texture(1)]],
                              texture2d<float, access::write> bg_term [[texture(2)]],
                              texture2d<float, access::write> fg_term [[texture(3)]],
                              constant GMMComponent* gmm_bg [[buffer(0)]],
@@ -284,8 +284,11 @@ kernel void gmmDataTermKernel(texture2d<float, access::sample> image [[texture(0
         fg_penalty = -log(fg_fallback_prob);
     }
      
-    bg_term.write(bg_penalty, gid);
-    fg_term.write(fg_penalty, gid);
+    // CRITICAL FIX: Clamp penalties to be non-negative. Probability density functions
+    // can return values > 1.0, which makes -log(density) negative. Graph-cut
+    // algorithms require non-negative costs.
+    bg_term.write(max(0.0f, bg_penalty), gid);
+    fg_term.write(max(0.0f, fg_penalty), gid);
 }
 
 // Reduction kernel for GMM learning (simplified version)
@@ -462,6 +465,9 @@ kernel void gmmFinalizeParametersKernel(device float* bgStats [[buffer(0)]],
                      cov_br * (cov_gr * cov_bg - cov_gg * cov_br);
             }
             
+            // Clamp determinant to be non-negative before division/sqrt to prevent NaN propagation.
+            det = max(det, 1e-9f);
+            
             // Calculate inverse covariance matrix (BGR order)
             float invDet = 1.0f / det;
             float invCov_bb = (cov_gg * cov_rr - cov_gr * cov_gr) * invDet;
@@ -550,6 +556,9 @@ kernel void gmmFinalizeParametersKernel(device float* bgStats [[buffer(0)]],
                      cov_gr * (cov_gr * cov_bb - cov_bg * cov_br) +
                      cov_br * (cov_gr * cov_bg - cov_gg * cov_br);
             }
+            
+            // Clamp determinant to be non-negative before division/sqrt to prevent NaN propagation.
+            det = max(det, 1e-9f);
             
             // Calculate inverse covariance matrix (BGR order)
             float invDet = 1.0f / det;

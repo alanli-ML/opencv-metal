@@ -98,7 +98,7 @@ PERF_TEST_P(MetalImgproc_GrabCut_Perf, Metal_Stream,
     {
         cv::metal::Stream stream;
         Mat mask_copy = mask.clone();
-        cv::metal::grabCut(image, mask_copy, rect, bgdModel, fgdModel, iterations, GC_INIT_WITH_RECT, stream);
+        cv::metal::grabCut(image, mask_copy, rect, bgdModel, fgdModel, iterations, GC_INIT_WITH_RECT, true, stream);
         stream.commitAndWait();
     }
     
@@ -193,49 +193,8 @@ PERF_TEST(MetalImgproc_GrabCut_Perf, ChainedOperations_Stream)
         for (int i = 0; i < 3; i++) {
             Mat mask = Mat::zeros(sz, CV_8UC1);
             Mat bgdModel, fgdModel;
-            cv::metal::grabCut(image, mask, rect, bgdModel, fgdModel, 2, GC_INIT_WITH_RECT, stream);
+            cv::metal::grabCut(image, mask, rect, bgdModel, fgdModel, 2, GC_INIT_WITH_RECT, true, stream);
         }
-        stream.commitAndWait();
-    }
-    
-    SANITY_CHECK_NOTHING();
-}
-
-// Component-level performance tests
-PERF_TEST(MetalImgproc_GrabCut_Perf, Beta_Calculation)
-{
-    Size sz = perf::sz1080p;
-    Mat image(sz, CV_8UC3);
-    randu(image, 0, 255);
-    
-    cv::metal::MetalMat d_image(image);
-    cv::metal::Stream stream;
-    
-    TEST_CYCLE()
-    {
-        double beta = cv::metal::calcBeta(d_image);
-        (void)beta; // Suppress unused variable warning
-    }
-    
-    SANITY_CHECK_NOTHING();
-}
-
-PERF_TEST(MetalImgproc_GrabCut_Perf, PairwiseWeights_Calculation)
-{
-    Size sz = perf::sz1080p;
-    Mat image(sz, CV_8UC3);
-    randu(image, 0, 255);
-    
-    cv::metal::MetalMat d_image(image);
-    cv::metal::MetalMat leftW, topleftW, topW, toprightW;
-    cv::metal::Stream stream;
-    
-    double beta = 0.1; // Typical value
-    double gamma = 50.0;
-    
-    TEST_CYCLE()
-    {
-        cv::metal::calcNWeights(d_image, leftW, topleftW, topW, toprightW, beta, gamma, stream);
         stream.commitAndWait();
     }
     

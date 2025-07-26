@@ -126,6 +126,7 @@ static MTLPixelFormat getMetalPixelFormat(int type)
             switch(cn)
             {
                 case 1: return MTLPixelFormatR32Float;
+                case 3: // Fallthrough
                 case 4: return MTLPixelFormatRGBA32Float;
             }
             break;

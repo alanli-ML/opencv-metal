@@ -46,13 +46,14 @@ kernel void edgeCuesKernel(texture2d<float, access::sample> image [[texture(0)]]
                           texture2d<float, access::write> topWeights [[texture(3)]],
                           texture2d<float, access::write> topRightWeights [[texture(4)]],
                           constant float& gamma [[buffer(0)]],
-                          constant float& beta [[buffer(1)]],
+                          device const float* betaBuffer [[buffer(1)]],
                           uint2 gid [[thread_position_in_grid]])
 {
     constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::nearest);
     
     if (gid.x >= image.get_width() || gid.y >= image.get_height()) return;
     
+    float beta = *betaBuffer; // Read beta from GPU buffer
     float4 centerPixel = image.sample(s, float2(gid) + 0.5f);
     float3 center = centerPixel.rgb; // Work with normalized [0,1] values
     
@@ -161,6 +162,29 @@ kernel void applyMatteKernel(texture2d<float, access::sample> image [[texture(0)
     result.write(float4(imagePixel.rgb, alpha), gid);
 }
 
+// Finalize beta calculation kernel (eliminates CPU synchronization)
+kernel void finalizeBetaKernel(device const float* betaSum [[buffer(0)]],
+                              device const uint* pixelCount [[buffer(1)]],
+                              device float* outBeta [[buffer(2)]],
+                              constant uint& width [[buffer(3)]],
+                              constant uint& height [[buffer(4)]],
+                              uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return; // Single thread kernel
+    
+    float totalSum = *betaSum;
+    uint totalCount = *pixelCount;
+    
+    if (totalCount == 0 || totalSum <= 1e-10f) {
+        *outBeta = 0.0f;
+        return;
+    }
+    
+    // CPU formula: beta = 1.f / (2 * beta/(4*img.cols*img.rows - 3*img.cols - 3*img.rows + 2));
+    float expectedCount = 4.0 * width * height - 3.0 * width - 3.0 * height + 2.0;
+    *outBeta = 1.0f / (2.0f * totalSum / expectedCount);
+}
+
 // Convergence check kernel
 kernel void convergenceCheckKernel(texture2d<uint, access::read> oldMask [[texture(0)]],
                                   texture2d<uint, access::read> newMask [[texture(1)]],
@@ -183,6 +207,7 @@ static id<MTLComputePipelineState> g_trimapFromRectPipeline = nil;
 static id<MTLComputePipelineState> g_edgeCuesPipeline = nil;
 static id<MTLComputePipelineState> g_betaCalculationPipeline = nil;
 static id<MTLComputePipelineState> g_applyMattePipeline = nil;
+static id<MTLComputePipelineState> g_finalizeBetaPipeline = nil;
 static id<MTLComputePipelineState> g_convergenceCheckPipeline = nil;
 static dispatch_once_t g_utilityPipelinesOnce = 0;
 
@@ -219,6 +244,9 @@ static void initializeUtilityPipelines() {
             
             id<MTLFunction> betaCalcFunc = [library newFunctionWithName:@"betaCalculationKernel"];
             g_betaCalculationPipeline = [device newComputePipelineStateWithFunction:betaCalcFunc error:&error];
+            
+            id<MTLFunction> finalizeBetaFunc = [library newFunctionWithName:@"finalizeBetaKernel"];
+            g_finalizeBetaPipeline = [device newComputePipelineStateWithFunction:finalizeBetaFunc error:&error];
             
             id<MTLFunction> applyMatteFunc = [library newFunctionWithName:@"applyMatteKernel"];
             g_applyMattePipeline = [device newComputePipelineStateWithFunction:applyMatteFunc error:&error];
@@ -277,6 +305,59 @@ void trimapFromRect(MetalMat& mask, const Rect& rect, Stream& stream) {
     }
     
     // Note: Let caller handle stream synchronization - don't commit here
+}
+
+// Async beta calculation that returns buffer instead of computed value
+id<MTLBuffer> calcBetaAsync(const MetalMat& image, Stream& stream) {
+    initializeUtilityPipelines();
+    
+    if (!g_betaCalculationPipeline || !g_finalizeBetaPipeline) {
+        CV_Error(Error::StsError, "Failed to create beta calculation pipelines");
+    }
+    
+    // Create buffers for reduction
+    MetalContext& ctx = MetalContext::getInstance();
+    id<MTLDevice> device = ctx.device;
+    
+    id<MTLBuffer> betaSumBuffer = [device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> pixelCountBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> betaResultBuffer = [device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
+    
+    // Initialize to zero
+    *((float*)betaSumBuffer.contents) = 0.0f;
+    *((uint32_t*)pixelCountBuffer.contents) = 0;
+    
+    // Phase 1: Calculate sum and count
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = StreamAccessor::createComputeEncoder(stream);
+        [encoder setComputePipelineState:g_betaCalculationPipeline];
+        [encoder setTexture:image.texture() atIndex:0];
+        [encoder setBuffer:betaSumBuffer offset:0 atIndex:0];
+        [encoder setBuffer:pixelCountBuffer offset:0 atIndex:1];
+        
+        MTLSize gridSize = MTLSizeMake(image.cols(), image.rows(), 1);
+        MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+        [encoder endEncoding];
+    }
+    
+    // Phase 2: Finalize beta calculation
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = StreamAccessor::createComputeEncoder(stream);
+        [encoder setComputePipelineState:g_finalizeBetaPipeline];
+        [encoder setBuffer:betaSumBuffer offset:0 atIndex:0];
+        [encoder setBuffer:pixelCountBuffer offset:0 atIndex:1];
+        [encoder setBuffer:betaResultBuffer offset:0 atIndex:2];
+        uint32_t width = image.cols();
+        uint32_t height = image.rows();
+        [encoder setBytes:&width length:sizeof(uint32_t) atIndex:3];
+        [encoder setBytes:&height length:sizeof(uint32_t) atIndex:4];
+        
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+    }
+    
+    return betaResultBuffer;
 }
 
 double calcBeta(const MetalMat& image, Stream& stream) {
@@ -361,7 +442,7 @@ double calcBeta(const MetalMat& image, Stream& stream) {
 }
 
 void calcNWeights(const MetalMat& image, MetalMat& leftW, MetalMat& topleftW, MetalMat& topW, MetalMat& toprightW, 
-                  double beta, double gamma, Stream& stream) {
+                  id<MTLBuffer> betaBuffer, double gamma, Stream& stream) {
     initializeUtilityPipelines();
     
     if (!g_edgeCuesPipeline) {
@@ -385,9 +466,8 @@ void calcNWeights(const MetalMat& image, MetalMat& leftW, MetalMat& topleftW, Me
         [encoder setTexture:toprightW.texture() atIndex:4];
         
         float gammaFloat = static_cast<float>(gamma);
-        float betaFloat = static_cast<float>(beta);
         [encoder setBytes:&gammaFloat length:sizeof(float) atIndex:0];
-        [encoder setBytes:&betaFloat length:sizeof(float) atIndex:1];
+        [encoder setBuffer:betaBuffer offset:0 atIndex:1]; // Use beta buffer instead of constant
         
         MTLSize gridSize = MTLSizeMake((image.cols() + 15) / 16, (image.rows() + 15) / 16, 1);
         MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
@@ -396,6 +476,38 @@ void calcNWeights(const MetalMat& image, MetalMat& leftW, MetalMat& topleftW, Me
         [encoder endEncoding];
     }
     // Note: Let caller handle stream synchronization - don't commit here
+}
+
+// Async convergence check - returns buffer with changed pixel count
+id<MTLBuffer> checkConvergenceAsync(const MetalMat& oldMask, const MetalMat& newMask, Stream& stream) {
+    initializeUtilityPipelines();
+    
+    if (!g_convergenceCheckPipeline) {
+        CV_Error(Error::StsError, "Failed to create convergence check pipeline");
+    }
+    
+    // Create atomic buffer for changed pixel count
+    MetalContext& ctx = MetalContext::getInstance();
+    id<MTLDevice> device = ctx.device;
+    id<MTLBuffer> changedCountBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    *((uint32_t*)changedCountBuffer.contents) = 0;
+    
+    // Use caller's stream to integrate with their pipeline
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = StreamAccessor::createComputeEncoder(stream);
+        [encoder setComputePipelineState:g_convergenceCheckPipeline];
+        [encoder setTexture:oldMask.texture() atIndex:0];
+        [encoder setTexture:newMask.texture() atIndex:1];
+        [encoder setBuffer:changedCountBuffer offset:0 atIndex:0];
+        
+        MTLSize gridSize = MTLSizeMake((oldMask.cols() + 15) / 16, (oldMask.rows() + 15) / 16, 1);
+        MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
+        
+        [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
+        [encoder endEncoding];
+    }
+    
+    return changedCountBuffer;
 }
 
 bool checkConvergence(const MetalMat& oldMask, const MetalMat& newMask, Stream& stream) {

@@ -3,8 +3,15 @@
 #ifdef HAVE_METAL
 
 #include "opencv2/imgproc.hpp"
+#include "opencv2/imgcodecs.hpp"
 #include "opencv2/metalimgproc.hpp"
 #include <iostream>
+
+// Forward declaration for the debug function
+namespace cv { namespace metal {
+    void grabCut_debug(InputArray _img, InputOutputArray _mask, Rect rect,
+                       cv::Mat& _bg_unary, cv::Mat& _fg_unary, Stream& stream);
+}}
 
 namespace opencv_test {
 
@@ -21,19 +28,55 @@ TEST(GraphCutFullGPU, DebugUnaryTerms)
     cv::Rect rect(1, 1, 6, 6);
     cv::Mat mask = cv::Mat::zeros(sz, CV_8UC1);
     cv::Mat bgdModel, fgdModel;
-    
-    // Run the Metal version 
-    cv::metal::grabCut(img, mask, rect, bgdModel, fgdModel, 1, cv::GC_INIT_WITH_RECT);
-    
+
+    // Use the debug function to extract unary terms
+    cv::Mat bg_unary, fg_unary;
+    cv::metal::Stream stream;
+    cv::metal::grabCut_debug(img, mask, rect, bg_unary, fg_unary, stream);
+    stream.commitAndWait();
+
     std::cout << "=== UNARY TERMS DEBUG ===" << std::endl;
-    std::cout << "Input image structure:" << std::endl;
-    for (int y = 0; y < sz.height; y++) {
-        for (int x = 0; x < sz.width; x++) {
-            cv::Vec3b pixel = img.at<cv::Vec3b>(y, x);
-            std::cout << "(" << (int)pixel[0] << "," << (int)pixel[1] << "," << (int)pixel[2] << ") ";
+    
+    std::cout << "--- BG Unary Costs (bg_unary) ---" << std::endl;
+    for (int y = 0; y < bg_unary.rows; ++y) {
+        for (int x = 0; x < bg_unary.cols; ++x) {
+            printf("%8.2f ", bg_unary.at<float>(y, x));
         }
-        std::cout << std::endl;
+        printf("\n");
     }
+
+    std::cout << "--- FG Unary Costs (fg_unary) ---" << std::endl;
+    for (int y = 0; y < fg_unary.rows; ++y) {
+        for (int x = 0; x < fg_unary.cols; ++x) {
+            printf("%8.2f ", fg_unary.at<float>(y, x));
+        }
+        printf("\n");
+    }
+
+    // Sample a background pixel (0,0) and a foreground pixel (3,3)
+    cv::Point bg_sample(0, 0);
+    cv::Point fg_sample(3, 3);
+
+    float bg_cost_at_bg = bg_unary.at<float>(bg_sample);
+    float fg_cost_at_bg = fg_unary.at<float>(bg_sample);
+    
+    float bg_cost_at_fg = bg_unary.at<float>(fg_sample);
+    float fg_cost_at_fg = fg_unary.at<float>(fg_sample);
+
+    std::cout << "BG Pixel (" << bg_sample.x << "," << bg_sample.y << "): BG Cost=" << bg_cost_at_bg
+              << ", FG Cost=" << fg_cost_at_bg << std::endl;
+    std::cout << "FG Pixel (" << fg_sample.x << "," << fg_sample.y << "): BG Cost=" << bg_cost_at_fg
+              << ", FG Cost=" << fg_cost_at_fg << std::endl;
+
+    // Expectation: For a BG pixel, BG cost should be lower.
+    // Note: This might fail if the GMM calculation is incorrect.
+    EXPECT_LT(bg_cost_at_bg, fg_cost_at_bg);
+    
+    // Expectation: For a FG pixel, FG cost should be lower.
+    EXPECT_LT(fg_cost_at_fg, bg_cost_at_fg);
+
+    // Run the full Metal version to see the final output
+    cv::metal::grabCut(img, mask, rect, bgdModel, fgdModel, 1, cv::GC_INIT_WITH_RECT);
     
     std::cout << "Resulting mask:" << std::endl;
     for (int y = 0; y < sz.height; y++) {
@@ -202,6 +245,128 @@ TEST(GraphCutFullGPU, BasicUnaryComparison)
     // Note: Not expecting foreground yet due to implementation issues
 }
 
+TEST(GraphCutFullGPU, TestWithRealImage)
+{
+    // Test with a real image instead of synthetic patterns
+    std::string imagePath = cv::samples::findFile("messi5.jpg");
+    cv::Mat img = cv::imread(imagePath);
+    
+    ASSERT_FALSE(img.empty()) << "Failed to load test image: " << imagePath;
+    
+    // Define a rectangle around Messi (approximate)
+    cv::Rect rect(85, 23, 222, 344);
+    
+    std::cout << "Testing with real image: " << imagePath << std::endl;
+    std::cout << "Image size: " << img.size() << std::endl;
+    std::cout << "Rect: " << rect << std::endl;
+    
+    // CPU version
+    cv::Mat mask_cpu = cv::Mat::zeros(img.size(), CV_8UC1);
+    cv::Mat bgd_cpu, fgd_cpu;
+    cv::grabCut(img, mask_cpu, rect, bgd_cpu, fgd_cpu, 5, cv::GC_INIT_WITH_RECT);
+    
+    // Metal version
+    cv::Mat mask_metal = cv::Mat::zeros(img.size(), CV_8UC1);
+    cv::Mat bgd_metal, fgd_metal;
+    cv::metal::grabCut(img, mask_metal, rect, bgd_metal, fgd_metal, 5, cv::GC_INIT_WITH_RECT);
+    
+    // Extract foreground masks
+    cv::Mat cpu_binary = (mask_cpu == cv::GC_FGD) | (mask_cpu == cv::GC_PR_FGD);
+    cv::Mat metal_binary = (mask_metal == cv::GC_FGD) | (mask_metal == cv::GC_PR_FGD);
+    
+    // Calculate IoU
+    cv::Mat intersection, union_mat;
+    cv::bitwise_and(cpu_binary, metal_binary, intersection);
+    cv::bitwise_or(cpu_binary, metal_binary, union_mat);
+    
+    double intersection_count = cv::sum(intersection)[0] / 255.0;
+    double union_count = cv::sum(union_mat)[0] / 255.0;
+    double iou = (union_count > 0) ? intersection_count / union_count : 1.0;
+    
+    // Count foreground pixels
+    double cpu_fg_count = cv::sum(cpu_binary)[0] / 255.0;
+    double metal_fg_count = cv::sum(metal_binary)[0] / 255.0;
+    
+    std::cout << "CPU foreground pixels: " << cpu_fg_count << std::endl;
+    std::cout << "Metal foreground pixels: " << metal_fg_count << std::endl;
+    std::cout << "IoU: " << iou << std::endl;
+    
+    // Save results for visual inspection
+    cv::Mat result_img = img.clone();
+    result_img.setTo(cv::Scalar(0, 0, 255), metal_binary);
+    cv::imwrite("grabcut_metal_result_messi.jpg", result_img);
+    
+    result_img = img.clone();
+    result_img.setTo(cv::Scalar(0, 255, 0), cpu_binary);
+    cv::imwrite("grabcut_cpu_result_messi.jpg", result_img);
+    
+    cv::imwrite("grabcut_mask_metal_messi.jpg", mask_metal * 80);
+    cv::imwrite("grabcut_mask_cpu_messi.jpg", mask_cpu * 80);
+    
+    // With real images, we expect some foreground detection
+    EXPECT_GT(metal_fg_count, 0) << "Metal implementation should detect some foreground";
+    EXPECT_GT(cpu_fg_count, 0) << "CPU implementation should detect some foreground";
+    
+    // IoU might be low initially due to implementation differences
+    // but should be > 0 if both detect something
+    if (cpu_fg_count > 0 && metal_fg_count > 0) {
+        EXPECT_GT(iou, 0.0) << "Should have some overlap between CPU and Metal results";
+    }
+}
+
+TEST(GraphCutFullGPU, TestWithLena)
+{
+    // Test with another real image
+    std::string imagePath = cv::samples::findFile("lena.jpg");
+    cv::Mat img = cv::imread(imagePath);
+    
+    ASSERT_FALSE(img.empty()) << "Failed to load test image: " << imagePath;
+    
+    // Define a rectangle around the face
+    cv::Rect rect(180, 70, 180, 240);
+    
+    std::cout << "Testing with real image: " << imagePath << std::endl;
+    std::cout << "Image size: " << img.size() << std::endl;
+    std::cout << "Rect: " << rect << std::endl;
+    
+    // Metal version only for this test
+    cv::Mat mask = cv::Mat::zeros(img.size(), CV_8UC1);
+    cv::Mat bgdModel, fgdModel;
+    cv::metal::grabCut(img, mask, rect, bgdModel, fgdModel, 3, cv::GC_INIT_WITH_RECT);
+    
+    // Extract foreground
+    cv::Mat fg_binary = (mask == cv::GC_FGD) | (mask == cv::GC_PR_FGD);
+    double fg_count = cv::sum(fg_binary)[0] / 255.0;
+    
+    std::cout << "Metal foreground pixels: " << fg_count << std::endl;
+    
+    // Count mask values
+    int counts[4] = {0, 0, 0, 0};
+    for (int y = 0; y < mask.rows; y++) {
+        for (int x = 0; x < mask.cols; x++) {
+            uchar val = mask.at<uchar>(y, x);
+            if (val < 4) counts[val]++;
+        }
+    }
+    
+    std::cout << "Mask value counts: BGD=" << counts[0] << " FGD=" << counts[1] 
+              << " PR_BGD=" << counts[2] << " PR_FGD=" << counts[3] << std::endl;
+    
+    // Save result
+    cv::Mat result_img = img.clone();
+    result_img.setTo(cv::Scalar(0, 0, 255), fg_binary);
+    cv::imwrite("grabcut_metal_result_lena.jpg", result_img);
+    cv::imwrite("grabcut_mask_metal_lena.jpg", mask * 80);
+    
+    // With real images, we definitely expect foreground detection
+    EXPECT_GT(fg_count, 0) << "Should detect foreground in real image";
+    
+    // Check that we have a reasonable foreground ratio (not all or nothing)
+    double fg_ratio = fg_count / (img.rows * img.cols);
+    EXPECT_GT(fg_ratio, 0.05) << "Should detect at least 5% foreground";
+    EXPECT_LT(fg_ratio, 0.95) << "Should not classify everything as foreground";
+}
+
 TEST(GraphCutFullGPU, CompareWithCPU_Minimal)
 {
     // Minimal comparison with CPU implementation
@@ -295,6 +460,91 @@ TEST(GraphCutFullGPU, DeterministicSharedKMeans)
     std::cout << "Deterministic test - different pixels: " << diffCount << std::endl;
     
     EXPECT_EQ(diffCount, 0) << "Results should be identical with same seed";
+}
+
+TEST(GraphCutFullGPU, UnaryTermVerification)
+{
+    // Test the unary term logic by checking specific pixel values
+    cv::Size sz(4, 4);
+    
+    // Create test data with known values
+    cv::Mat img(sz, CV_8UC3);
+    cv::Mat unary_bg(sz, CV_32FC1);
+    cv::Mat unary_fg(sz, CV_32FC1);
+    
+    // Fill with test pattern
+    for (int y = 0; y < sz.height; y++) {
+        for (int x = 0; x < sz.width; x++) {
+            // Simple gradient pattern
+            img.at<cv::Vec3b>(y, x) = cv::Vec3b(x * 50, y * 50, 100);
+            
+            // Mock GMM costs (lower is better)
+            unary_bg.at<float>(y, x) = 10.0f + x + y;  // Background cost
+            unary_fg.at<float>(y, x) = 20.0f + x + y;  // Foreground cost
+        }
+    }
+    
+    // Create mask with different constraint types
+    cv::Mat mask(sz, CV_8UC1);
+    mask.at<uchar>(0, 0) = cv::GC_BGD;     // Sure background
+    mask.at<uchar>(0, 1) = cv::GC_FGD;     // Sure foreground
+    mask.at<uchar>(1, 0) = cv::GC_PR_BGD;  // Probable background
+    mask.at<uchar>(1, 1) = cv::GC_PR_FGD;  // Probable foreground
+    // Rest are PR_BGD by default
+    for (int y = 0; y < sz.height; y++) {
+        for (int x = 2; x < sz.width; x++) {
+            mask.at<uchar>(y, x) = cv::GC_PR_BGD;
+        }
+    }
+    for (int y = 2; y < sz.height; y++) {
+        for (int x = 0; x < 2; x++) {
+            mask.at<uchar>(y, x) = cv::GC_PR_BGD;
+        }
+    }
+    
+    // Run GrabCut with these unary terms
+    cv::Mat bgdModel, fgdModel;
+    cv::Rect rect(0, 0, sz.width, sz.height);
+    
+    // Initialize models with our mock unary terms
+    bgdModel.create(1, 65, CV_64FC1);
+    fgdModel.create(1, 65, CV_64FC1);
+    
+    // Copy unary terms into model format (simplified - just using first values)
+    for (int i = 0; i < 65; i++) {
+        bgdModel.at<double>(0, i) = 0.5; // Mock values
+        fgdModel.at<double>(0, i) = 0.5;
+    }
+    
+    cv::Mat mask_result = mask.clone();
+    
+    try {
+        cv::metal::grabCut(img, mask_result, rect, bgdModel, fgdModel, 1, cv::GC_EVAL);
+        
+        std::cout << "=== Unary Term Verification ===\n";
+        std::cout << "Input mask:\n";
+        for (int y = 0; y < 2; y++) {
+            for (int x = 0; x < 2; x++) {
+                std::cout << (int)mask.at<uchar>(y, x) << " ";
+            }
+            std::cout << "\n";
+        }
+        
+        std::cout << "Output mask:\n";
+        for (int y = 0; y < 2; y++) {
+            for (int x = 0; x < 2; x++) {
+                std::cout << (int)mask_result.at<uchar>(y, x) << " ";
+            }
+            std::cout << "\n";
+        }
+        
+        // Check that sure constraints are preserved
+        EXPECT_EQ(mask_result.at<uchar>(0, 0), cv::GC_BGD) << "Sure background should remain BGD";
+        EXPECT_EQ(mask_result.at<uchar>(0, 1), cv::GC_FGD) << "Sure foreground should remain FGD";
+        
+    } catch (const cv::Exception& e) {
+        FAIL() << "Exception in unary term test: " << e.what();
+    }
 }
 
 } // namespace opencv_test

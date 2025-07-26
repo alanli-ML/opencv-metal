@@ -36,6 +36,10 @@ public:
     // Access debug buffer for debugging probability calculations
     id<MTLBuffer> getDebugBuffer() const { return m_debugBuffer; }
     
+    // Phase 4: Expose GMM buffers for GPU-resident parameters
+    id<MTLBuffer> getBgBuffer() const { return m_gmmBgBuffer; }
+    id<MTLBuffer> getFgBuffer() const { return m_gmmFgBuffer; }
+    
     Size size() const { return m_imageSize; }
     
 private:

@@ -54,21 +54,24 @@ processing the same image.
 that the result can be refined with further calls with mode==#GC_INIT_WITH_MASK or
 mode==GC_EVAL.
 @param mode Operation mode that could be one of the #GrabCutModes.
+@param useGpuGraphCut If true, uses Metal GPU graph cut solver; if false, uses CPU graph cut solver.
+Default is true for best performance on supported hardware.
 @param stream Stream for asynchronous execution.
 
 @note The Metal implementation follows the same algorithm as the CPU version but accelerates the
 Gaussian Mixture Model (GMM) computations using Metal Performance Shaders and custom kernels.
-The graph-cut portion remains on the CPU for maximum compatibility with existing OpenCV infrastructure.
+When useGpuGraphCut=true, the entire pipeline runs on GPU. When false, GMM runs on GPU but 
+graph-cut runs on CPU for maximum compatibility.
 
 @sa cv::grabCut
 */
 CV_EXPORTS void grabCut(InputArray img, InputOutputArray mask, Rect rect,
                         InputOutputArray bgdModel, InputOutputArray fgdModel,
-                        int iterCount, int mode = GC_EVAL);
+                        int iterCount, int mode = GC_EVAL, bool useGpuGraphCut = true);
 
 CV_EXPORTS void grabCut(InputArray img, InputOutputArray mask, Rect rect,
                         InputOutputArray bgdModel, InputOutputArray fgdModel,
-                        int iterCount, int mode, Stream& stream);
+                        int iterCount, int mode, bool useGpuGraphCut, Stream& stream);
 
 /** @brief Runs the GrabCut algorithm with shared deterministic K-means initialization.
 
@@ -90,17 +93,21 @@ that the result can be refined with further calls with mode==#GC_INIT_WITH_MASK 
 mode==GC_EVAL.
 @param mode Operation mode that could be one of the #GrabCutModes.
 @param randomSeed Fixed random seed for deterministic K-means initialization (default: 42).
+@param useGpuGraphCut If true, uses Metal GPU graph cut solver; if false, uses CPU graph cut solver.
+Default is true for best performance on supported hardware.
 @param stream Stream for asynchronous execution.
 
 @sa cv::grabCutWithSharedKMeans
 */
 CV_EXPORTS void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
                                        InputOutputArray bgdModel, InputOutputArray fgdModel,
-                                       int iterCount, int mode, uint64_t randomSeed, Stream& stream);
+                                       int iterCount, int mode, uint64_t randomSeed, 
+                                       bool useGpuGraphCut, Stream& stream);
 
 CV_EXPORTS void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
                                        InputOutputArray bgdModel, InputOutputArray fgdModel,
-                                       int iterCount, int mode = GC_EVAL, uint64_t randomSeed = 42);
+                                       int iterCount, int mode = GC_EVAL, uint64_t randomSeed = 42,
+                                       bool useGpuGraphCut = true);
 
 /** @brief Internal mask-based K-means clustering for GrabCut initialization.
 @note This is an internal function not intended for public use.

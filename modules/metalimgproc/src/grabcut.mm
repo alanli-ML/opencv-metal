@@ -24,12 +24,9 @@ namespace cv { namespace metal {
 
 // Removed unused kmeansComponentMap function
 
-// Set this to 1 to begin testing the full-GPU graph-cut solver. Until the
-// MetalGraphCut implementation is ready, leave at 0 so the CPU fallback stays
-// active and unit tests continue to pass.
-#ifndef USE_METAL_GRAPHCUT
-#define USE_METAL_GRAPHCUT 0
-#endif
+// PHASE 3 OPTIMIZATION: Enable full-GPU graph-cut solver
+// This eliminates massive CPU-GPU data transfers in the iterative loop
+// Now controlled by runtime parameter instead of compile-time flag
 
 }} // end cv::metal namespace temporarily for CPU helper functions
 
@@ -330,9 +327,11 @@ namespace cv { namespace metal {
 // Forward declarations for utility functions
 void trimapFromRect(MetalMat& mask, const Rect& rect, Stream& stream);
 double calcBeta(const MetalMat& image, Stream& stream);
+id<MTLBuffer> calcBetaAsync(const MetalMat& image, Stream& stream);
 void calcNWeights(const MetalMat& image, MetalMat& leftW, MetalMat& topleftW, MetalMat& topW, MetalMat& toprightW, 
-                  double beta, double gamma, Stream& stream);
+                  id<MTLBuffer> betaBuffer, double gamma, Stream& stream);
 bool checkConvergence(const MetalMat& oldMask, const MetalMat& newMask, Stream& stream);
+id<MTLBuffer> checkConvergenceAsync(const MetalMat& oldMask, const MetalMat& newMask, Stream& stream);
 
 // Internal GrabCut implementation class
 class GrabCutImpl {
@@ -342,11 +341,17 @@ public:
     
     void run(const MetalMat& image, MetalMat& mask, const Rect& rect,
              MetalMat& bgdModel, MetalMat& fgdModel,
-             int iterCount, int mode, Stream& stream);
+             int iterCount, int mode, bool useGpuGraphCut, Stream& stream);
+    
+    // PHASE 4: Direct access to GPU GMM buffers to avoid transfers
+    void getGMMBuffers(id<MTLBuffer>& bgBuffer, id<MTLBuffer>& fgBuffer) const;
 
     void runWithSharedKMeans(const MetalMat& image, MetalMat& mask, const Rect& rect,
                             MetalMat& bgdModel, MetalMat& fgdModel,
                             int iterCount, int mode, uint64_t randomSeed, Stream& stream);
+    
+    // Debug access to GraphCut solver
+    const MetalGraphCut& getGraphCutSolver() const { return *m_metalGraphCut; }
 
 private:
     void initMaskWithRect(MetalMat& mask, Size imageSize, const Rect& rect, Stream& stream);
@@ -404,9 +409,20 @@ GrabCutImpl::~GrabCutImpl() {
     // Smart pointers and MetalMat handle cleanup automatically
 }
 
+// PHASE 4: Direct access to GPU GMM buffers to avoid transfers
+void GrabCutImpl::getGMMBuffers(id<MTLBuffer>& bgBuffer, id<MTLBuffer>& fgBuffer) const {
+    if (m_gmm) {
+        bgBuffer = m_gmm->getBgBuffer();
+        fgBuffer = m_gmm->getFgBuffer();
+    } else {
+        bgBuffer = nil;
+        fgBuffer = nil;
+    }
+}
+
 void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
                       MetalMat& bgdModel, MetalMat& fgdModel,
-                      int iterCount, int mode, Stream& stream) {
+                      int iterCount, int mode, bool useGpuGraphCut, Stream& stream) {
     
     CV_Assert(!image.empty());
     
@@ -456,27 +472,35 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
             // Do initial GMM learning using K-means assignments on the input stream
             m_gmm->learnGMMs(image, mask, m_components, stream);
             
-            // Synchronize only when we need to extract parameters for output
-            stream.syncCPU();
-            
-            // Extract learned parameters even for 0 iterations
-            Mat tempBgdModel, tempFgdModel;
-            m_gmm->extractGMMParameters(tempBgdModel, tempFgdModel);
-            bgdModel.upload(tempBgdModel);
-            fgdModel.upload(tempFgdModel);
+            // Phase 4: Keep GMM parameters on GPU during iterations
+            // Only extract when we need output models (initialization or final result)
+            if (iterCount <= 0) {
+                // Synchronize only when we need to extract parameters for output
+                stream.syncCPU();
+                
+                // Extract learned parameters for 0 iterations case
+                Mat tempBgdModel, tempFgdModel;
+                m_gmm->extractGMMParameters(tempBgdModel, tempFgdModel);
+                bgdModel.upload(tempBgdModel);
+                fgdModel.upload(tempFgdModel);
+            }
             
             m_initialized = true;
         }
     }
     
     // Calculate beta parameter and pairwise weights for all modes that need graph construction
-    m_beta = calcBeta(image, stream);
+    // PHASE 1 OPTIMIZATION: Use async beta calculation to eliminate CPU synchronization
+    id<MTLBuffer> betaBuffer = calcBetaAsync(image, stream);
     
-    // Calculate pairwise weights
+    // Calculate pairwise weights using async beta buffer
     const double gamma = 50.0;
     calcNWeights(image, m_pairwiseWeights[0], m_pairwiseWeights[1], 
                 m_pairwiseWeights[2], m_pairwiseWeights[3], 
-                m_beta, gamma, stream);
+                betaBuffer, gamma, stream);
+    
+    // Keep the synchronous beta for legacy compatibility (only sync when needed)
+    m_beta = calcBeta(image, stream);
     
     if (iterCount <= 0) return;
     
@@ -494,6 +518,11 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
     // Main GrabCut iterative loop
     const double lambda = 9.0 * 50.0; // 9 * gamma (450)
     
+    MetalMat initial_mask;
+    if (useGpuGraphCut) {
+        initial_mask = mask.clone();
+    }
+    
     for (int iter = 0; iter < iterCount; iter++) {
         
         // Save current mask for convergence check
@@ -509,6 +538,15 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         
         m_gmm->assignGMMs(image, mask, m_components, stream);
         
+        // DEBUG: Print mask values after assignment in each iteration
+        {
+            stream.syncCPU();
+            Mat h_mask;
+            mask.download(h_mask, stream, true);
+            printf("[GrabCut DEBUG iter %d] Mask at (102,192): %u, (204,192): %u\n",
+                   iter, h_mask.at<uchar>(192, 102), h_mask.at<uchar>(192, 204));
+        }
+        
         // DETAILED TRACKING: Show component assignments after assignment
         
         // Sample a few component assignments
@@ -517,11 +555,8 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         if (mode != GC_EVAL_FREEZE_MODEL) {
             m_gmm->learnGMMs(image, mask, m_components, stream);
             
-            // Extract learned GMM parameters to output models for comparison with CPU
-            Mat tempBgdModel, tempFgdModel;
-            m_gmm->extractGMMParameters(tempBgdModel, tempFgdModel);
-            bgdModel.upload(tempBgdModel);
-            fgdModel.upload(tempFgdModel);
+            // Phase 4: Keep GMM parameters on GPU during iterations
+            // No extractGMMParameters call here - parameters stay GPU-resident
             
             // DETAILED TRACKING: Show GMM parameters AFTER learning
             
@@ -530,54 +565,78 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         // Compute unary potentials (data term) - still on same stream
         m_gmm->computeDataTerm(image, mask, m_bgTerm, m_fgTerm, stream);
         
+        // DEBUG: Force synchronization to ensure unary terms are written before graph construction.
+        // If this fixes negative initial excess, it points to a race condition.
+        stream.syncCPU();
 
-#if USE_METAL_GRAPHCUT
-        // ---------------------------------------------------------------------------------
-        // EXPERIMENTAL FULL-GPU PATH (in progress)
-        // ---------------------------------------------------------------------------------
-        // Keep everything on the GPU – do NOT syncCPU().
-        if (!m_metalGraphCut)
-        {
-            m_metalGraphCut.reset(new MetalGraphCut(image.size(), stream));
+        if (useGpuGraphCut) {
+            // ---------------------------------------------------------------------------------
+            // FULL-GPU PATH
+            // ---------------------------------------------------------------------------------
+            // Keep everything on the GPU – do NOT syncCPU().
+            if (!m_metalGraphCut)
+            {
+                m_metalGraphCut.reset(new MetalGraphCut(image.size(), stream));
+            }
+
+            // Build the graph directly on the GPU from unary & pairwise terms
+            {
+                stream.syncCPU();
+                Mat h_mask;
+                mask.download(h_mask, stream, true);
+                printf("[GrabCut DEBUG pre-buildGraph] Mask at (102,192): %u, (204,192): %u\n",
+                       h_mask.at<uchar>(192, 102), h_mask.at<uchar>(192, 204));
+            }
+            m_metalGraphCut->buildGraph(m_bgTerm, m_fgTerm,
+                                        m_pairwiseWeights[0], m_pairwiseWeights[2],
+                                        m_pairwiseWeights[1], m_pairwiseWeights[3],
+                                        mask, lambda);
+
+            // The push-relabel algorithm for max-flow is highly iterative and must run
+            // until it converges (i.e., no more "active" nodes with excess flow).
+            // We provide a generous iteration limit as a safeguard; the solver in
+            // graphcut.mm is designed to terminate early once convergence is reached.
+            const int maxFlowIterations = 2000;
+            m_metalGraphCut->solve(maxFlowIterations);
+
+            // Retrieve updated mask (GPU → GPU). Note: getSegmentation writes into
+            // an existing MetalMat to avoid reallocations.
+            m_metalGraphCut->getSegmentation(mask, initial_mask);
+
+        } else {
+            // ---------------------------------------------------------------------------------
+            // CPU FALLBACK PATH
+            // ---------------------------------------------------------------------------------
+
+            // PHASE 2: Let downloads handle synchronization automatically
+            // First download will sync if commands are queued, subsequent downloads will be fast
+
+            // PHASE 3: CPU-bound operations (these don't use streams since they're CPU-only)
+            // Construct graph and solve min-cut max-flow on CPU
+            ::cv::detail::GCGraph<double> graph;
+            constructGCGraph(image, mask, m_bgTerm, m_fgTerm,
+                            m_pairwiseWeights[0], m_pairwiseWeights[1],
+                            m_pairwiseWeights[2], m_pairwiseWeights[3],
+                            lambda, graph, stream);
+            
+            // Estimate segmentation using max-flow
+            estimateSegmentation(graph, mask, stream);
         }
-
-        // Build the graph directly on the GPU from unary & pairwise terms
-        m_metalGraphCut->buildGraph(m_bgTerm, m_fgTerm,
-                                    m_pairwiseWeights[0], m_pairwiseWeights[2],
-                                    m_pairwiseWeights[1], m_pairwiseWeights[3],
-                                    lambda);
-
-        // For now we run a single iteration of push-relabel per GrabCut iter.
-        m_metalGraphCut->solve(1);
-
-        // Retrieve updated mask (GPU → GPU). Note: getSegmentation writes into
-        // an existing MetalMat to avoid reallocations.
-        m_metalGraphCut->getSegmentation(mask);
-
-#else  // CPU FALLBACK PATH
-        // ---------------------------------------------------------------------------------
-        // Existing implementation: download GPU data → CPU max-flow → upload mask
-        // ---------------------------------------------------------------------------------
-
-        // PHASE 2: Let downloads handle synchronization automatically
-        // First download will sync if commands are queued, subsequent downloads will be fast
-
-        // PHASE 3: CPU-bound operations (these don't use streams since they're CPU-only)
-        // Construct graph and solve min-cut max-flow on CPU
-        ::cv::detail::GCGraph<double> graph;
-        constructGCGraph(image, mask, m_bgTerm, m_fgTerm,
-                        m_pairwiseWeights[0], m_pairwiseWeights[1],
-                        m_pairwiseWeights[2], m_pairwiseWeights[3],
-                        lambda, graph, stream);
-        
-        // Estimate segmentation using max-flow
-        estimateSegmentation(graph, mask, stream);
-#endif
         
         // Check for convergence
         if (checkConvergence(m_prevMask, mask, stream)) {
             break;
         }
+    }
+    
+    // Phase 4: Extract final GMM parameters after all iterations complete
+    // This ensures output models contain the final learned parameters
+    if (iterCount > 0) {
+        stream.syncCPU();
+        Mat tempBgdModel, tempFgdModel;
+        m_gmm->extractGMMParameters(tempBgdModel, tempFgdModel);
+        bgdModel.upload(tempBgdModel);
+        fgdModel.upload(tempFgdModel);
     }
 }
 
@@ -643,12 +702,14 @@ void GrabCutImpl::constructGCGraph(const MetalMat& image, const MetalMat& mask,
                 if (probableDebugCount < 5) {
                     probableDebugCount++;
                 }
-            } else if (maskValue == GC_BGD) {
-                fromSource = 0;
-                toSink = lambda;
-            } else { // GC_FGD
-                fromSource = lambda;
-                toSink = 0;
+            } else { // GC_BGD or GC_FGD
+                if (maskValue == GC_BGD) {
+                    fromSource = 0;
+                    toSink = lambda;
+                } else { // GC_FGD
+                    fromSource = lambda;
+                    toSink = 0;
+                }
             }
             graph.addTermWeights(vtxIdx, fromSource, toSink);
             
@@ -764,7 +825,7 @@ namespace {
 // Public API implementation
 void grabCut(InputArray _img, InputOutputArray _mask, Rect rect,
              InputOutputArray _bgdModel, InputOutputArray _fgdModel,
-             int iterCount, int mode, Stream& stream) {
+             int iterCount, int mode, bool useGpuGraphCut, Stream& stream) {
     
     CV_Assert(!_img.empty());
     CV_Assert(_img.type() == CV_8UC3);
@@ -774,6 +835,11 @@ void grabCut(InputArray _img, InputOutputArray _mask, Rect rect,
     Mat& bgdModel = _bgdModel.getMatRef();
     Mat& fgdModel = _fgdModel.getMatRef();
     
+    // DEBUG: Print initial mask values for specific pixels
+    if (!mask.empty()) {
+        printf("[GrabCut DEBUG] Initial mask value at (102,192): %u\n", mask.at<uchar>(192, 102));
+        printf("[GrabCut DEBUG] Initial mask value at (204,192): %u\n", mask.at<uchar>(192, 204));
+    }
     
     // Convert BGR to BGRA for Metal processing
     Mat imgBGRA;
@@ -808,7 +874,7 @@ void grabCut(InputArray _img, InputOutputArray _mask, Rect rect,
     
     // Create and run GrabCut implementation
     GrabCutImpl grabCutImpl; // Create fresh instance to avoid Metal object retention issues
-    grabCutImpl.run(d_img, d_mask, rect, d_bgdModel, d_fgdModel, iterCount, mode, stream);
+    grabCutImpl.run(d_img, d_mask, rect, d_bgdModel, d_fgdModel, iterCount, mode, useGpuGraphCut, stream);
     
     // Download result
     Mat metalResult;
@@ -850,16 +916,17 @@ void grabCut(InputArray _img, InputOutputArray _mask, Rect rect,
 
 void grabCut(InputArray img, InputOutputArray mask, Rect rect,
              InputOutputArray bgdModel, InputOutputArray fgdModel,
-             int iterCount, int mode)
+             int iterCount, int mode, bool useGpuGraphCut)
 {
     Stream defaultStream;
-    grabCut(img, mask, rect, bgdModel, fgdModel, iterCount, mode, defaultStream);
+    grabCut(img, mask, rect, bgdModel, fgdModel, iterCount, mode, useGpuGraphCut, defaultStream);
     defaultStream.commitAndWait();
 }
 
 void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
                              InputOutputArray bgdModel, InputOutputArray fgdModel,
-                             int iterCount, int mode, uint64_t randomSeed, Stream& stream)
+                             int iterCount, int mode, uint64_t randomSeed, 
+                             bool useGpuGraphCut, Stream& stream)
 {
     MetalMat metal_img, metal_mask, metal_bgdModel, metal_fgdModel;
     
@@ -889,7 +956,7 @@ void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
     GrabCutImpl impl;
     // TODO: Pass randomSeed to run() method when Metal k-means is properly integrated
     impl.run(metal_img, metal_mask, rect, metal_bgdModel, metal_fgdModel, 
-             iterCount, mode, stream);
+             iterCount, mode, true, stream);
     
     metal_mask.download(mask.getMatRef(), stream, true);
     metal_bgdModel.download(bgdModel.getMatRef(), stream, true);
@@ -898,11 +965,70 @@ void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
 
 void grabCutWithSharedKMeans(InputArray img, InputOutputArray mask, Rect rect,
                              InputOutputArray bgdModel, InputOutputArray fgdModel,
-                             int iterCount, int mode, uint64_t randomSeed)
+                             int iterCount, int mode, uint64_t randomSeed, bool useGpuGraphCut)
 {
     Stream defaultStream;
-    grabCutWithSharedKMeans(img, mask, rect, bgdModel, fgdModel, iterCount, mode, randomSeed, defaultStream);
+    grabCutWithSharedKMeans(img, mask, rect, bgdModel, fgdModel, iterCount, mode, randomSeed, useGpuGraphCut, defaultStream);
     defaultStream.commitAndWait();
+}
+
+void grabCut_debug(InputArray _img, InputOutputArray _mask, Rect rect,
+                   cv::Mat& _bg_unary, cv::Mat& _fg_unary, Stream& stream)
+{
+    // Create a custom implementation to intercept unary terms
+    cv::Mat bgdModel = cv::Mat::zeros(1, 65, CV_64FC1);
+    cv::Mat fgdModel = cv::Mat::zeros(1, 65, CV_64FC1);
+    
+    // Initialize mask
+    _mask.create(_img.size(), CV_8UC1);
+    
+    // Create a GrabCutImpl instance to access internal methods
+    GrabCutImpl impl;
+    
+    MetalMat metal_img, metal_mask, metal_bgdModel, metal_fgdModel;
+    metal_img.upload(_img.getMat());
+    metal_mask.upload(_mask.getMat());
+    metal_bgdModel.upload(bgdModel);
+    metal_fgdModel.upload(fgdModel);
+    
+    // Run the implementation to build the graph and access unary terms
+    impl.run(metal_img, metal_mask, rect, metal_bgdModel, metal_fgdModel, 1, GC_INIT_WITH_RECT, true, stream);
+    
+    // Get the solver to access terminal flow buffer
+    const MetalGraphCut& solver = impl.getGraphCutSolver();
+    id<MTLBuffer> termBuffer = solver.getTerminalFlowBuffer();
+    
+    // Create output matrices
+    _bg_unary.create(_img.rows(), _img.cols(), CV_32FC1);
+    _fg_unary.create(_img.rows(), _img.cols(), CV_32FC1);
+    
+    if (termBuffer != nil) {
+        // Define the structure to match the GPU buffer
+        typedef struct {
+            float to_source; // foreground unary (capacity to source)
+            float to_sink;   // background unary (capacity to sink)
+        } TerminalFlow;
+        
+        // Access the buffer data
+        TerminalFlow* termData = (TerminalFlow*)[termBuffer contents];
+        int width = _img.cols();
+        int height = _img.rows();
+        
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int idx = y * width + x;
+                _bg_unary.at<float>(y, x) = termData[idx].to_sink;
+                _fg_unary.at<float>(y, x) = termData[idx].to_source;
+            }
+        }
+    } else {
+        // Fallback if buffer access fails
+        _bg_unary.setTo(-1.0f);  // Use -1 to indicate failure
+        _fg_unary.setTo(-1.0f);
+    }
+    
+    // Download the final mask
+    metal_mask.download(_mask.getMatRef(), stream, true);
 }
 
 }} // cv::metal

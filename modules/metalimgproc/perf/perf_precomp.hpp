@@ -11,11 +11,6 @@
 
 namespace cv { namespace metal {
 
-// Forward declarations for testing internal functions
-double calcBeta(const MetalMat& image);
-void calcNWeights(const MetalMat& image, MetalMat& leftW, MetalMat& topleftW, MetalMat& topW, MetalMat& toprightW, 
-                  double beta, double gamma, Stream& stream);
-
 }} // cv::metal
 
 #endif // HAVE_METAL

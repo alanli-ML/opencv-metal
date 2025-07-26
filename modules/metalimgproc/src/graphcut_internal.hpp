@@ -44,6 +44,7 @@ public:
                     const MetalMat& pairwise_top,
                     const MetalMat& pairwise_topleft,
                     const MetalMat& pairwise_topright,
+                    const MetalMat& mask,
                     double lambda);
 
     /**
@@ -53,10 +54,15 @@ public:
     void solve(int iterations);
 
     /**
-     * Retrieve the final segmentation mask into \p mask. The mask must be a
+     * Retrieve the final segmentation mask into \\p mask. The mask must be a
      * MetalMat of type CV_8UC1 and same spatial dimensions as the image.
      */
-    void getSegmentation(MetalMat& mask);
+    void getSegmentation(MetalMat& mask, const MetalMat& initial_mask);
+    
+    /**
+     * Debug access to terminal flow buffer for unary term analysis.
+     */
+    id<MTLBuffer> getTerminalFlowBuffer() const { return m_terminalFlow; }
 
 private:
     // We deliberately keep the member list minimal for now – additional GPU
@@ -73,12 +79,18 @@ private:
     id<MTLBuffer> m_terminalFlow  = nil; // source/sink capacities
     id<MTLBuffer> m_residualCap   = nil; // float4 neighbour capacities (left, top-left, top, top-right)
 
-    // BFS traversal buffers
-    id<MTLBuffer> m_currLevel    = nil; // uint list of nodes for current frontier
-    id<MTLBuffer> m_nextLevel    = nil; // uint list of nodes for next frontier
-    id<MTLBuffer> m_levelCount   = nil; // uint[1] counter for next level size
+    // BFS traversal buffers / Active Lists (ping-pong)
+    id<MTLBuffer> m_activeList1    = nil;
+    id<MTLBuffer> m_activeList2    = nil;
+    id<MTLBuffer> m_levelCount   = nil; // uint[1] counter for active list size
 
     id<MTLBuffer> m_excessFlag   = nil; // uint[1] flag for push-relabel convergence
+    
+    // Phase 3 Optimization buffers
+    id<MTLBuffer> m_heightHistogram = nil;
+    
+    // Phase 4 Final cut buffers
+    id<MTLBuffer> m_finalCutLabels  = nil; // int array for final BFS reachability
 
     // --- Atomics refactor buffers (slice 1) ---
     id<MTLBuffer> m_nodeDataAtom   = nil; // NodeDataAtom array (atomic excess+label)
@@ -86,6 +98,10 @@ private:
 
     // Allocation helper
     void allocateGraphBuffers();
+
+    // Phase 3 Optimization helpers
+    void runGlobalRelabel();
+    void createActiveList();
 
     // Lazy-initialised compute pipeline for the provisional segmentation pass.
     static id<MTLComputePipelineState> getSimpleSegmentationPipeline();
@@ -97,6 +113,18 @@ private:
     static id<MTLComputePipelineState> getBFSInitPipeline();
     static id<MTLComputePipelineState> getBFSTraversePipeline();
     static id<MTLComputePipelineState> getLabelSegmentationPipeline();
+    
+    // New pipelines for push-relabel and optimizations
+    static id<MTLComputePipelineState> getGlobalRelabelInitPipeline();
+    static id<MTLComputePipelineState> getGlobalRelabelBfsTraversePipeline();
+    static id<MTLComputePipelineState> getCreateInitialActiveListPipeline();
+    static id<MTLComputePipelineState> getPushRelabelPipeline();
+    static id<MTLComputePipelineState> getBuildHeightHistogramPipeline();
+    static id<MTLComputePipelineState> getGapRelabelPipeline();
+    static id<MTLComputePipelineState> getFinalCutBfsInitPipeline();
+    static id<MTLComputePipelineState> getFinalCutBfsTraversePipeline();
+    static id<MTLComputePipelineState> getFinalCutWriteMaskPipeline();
+    static id<MTLComputePipelineState> getSimpleFinalCutPipeline();
 };
 
 }} // namespace cv::metal

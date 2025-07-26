@@ -39,14 +39,14 @@ if(HAVE_METAL)
   target_link_libraries(${the_module} PRIVATE ${METAL_LIBRARY} ${METALPERFORMANCESHADERS_LIBRARY} ${FOUNDATION_LIBRARY} ${COREGRAPHICS_LIBRARY})
 endif()
 
-option(ENABLE_FULLGPU_GRABCUT "Enable full GPU GraphCut tests" OFF)
+option(ENABLE_FULLGPU_GRABCUT "Enable full GPU GraphCut tests" ON)
 
 ocv_add_accuracy_tests()
 
-# Conditional Metal Graph Cut Support
-target_compile_definitions(${the_module} PRIVATE USE_METAL_GRAPHCUT=0)
+# Conditional Metal Graph Cut Support - Phase 3 Implementation
+target_compile_definitions(${the_module} PRIVATE USE_METAL_GRAPHCUT=1)
 if(BUILD_TESTS AND TARGET opencv_test_metalimgproc)
-  target_compile_definitions(opencv_test_metalimgproc PRIVATE USE_METAL_GRAPHCUT=0)
+  target_compile_definitions(opencv_test_metalimgproc PRIVATE USE_METAL_GRAPHCUT=1)
 endif()
 
 if(HAVE_METAL)
