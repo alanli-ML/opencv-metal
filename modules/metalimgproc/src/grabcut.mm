@@ -30,6 +30,7 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
     }
     
     if (useMetalKMeans && stream) {
+        printf("[MetalGrabCut DEBUG] Attempting Metal k-means path...\n");
         // METAL PATH: Use direct mask-based k-means without intermediate samples
         try {
             // Convert input image to BGRA format for Metal
@@ -70,11 +71,14 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
             return; // Success - exit early
             
         } catch (const cv::Exception& e) {
+            printf("[MetalGrabCut DEBUG] Metal k-means path failed with exception: %s\n", e.what());
+            printf("[MetalGrabCut DEBUG] Falling back to CPU k-means path.\n");
             // Fall through to CPU implementation
         }
     }
     
     // CPU PATH: Traditional sample-based approach (fallback or when Metal disabled)
+    printf("[MetalGrabCut DEBUG] Using CPU k-means path.\n");
     
     cv::Mat bgdLabels, fgdLabels;
     std::vector<cv::Vec3f> bgdSamples, fgdSamples;
@@ -93,7 +97,10 @@ void initGMMsWithKMeans(const cv::Mat& img, const cv::Mat& mask, cv::Mat& compId
     
     CV_Assert(!bgdSamples.empty() && !fgdSamples.empty());
     
-
+    // --- BEGIN DEBUG: Print sample counts ---
+    printf("[MetalGrabCut DEBUG] K-Means Sampling (CPU Path): bgd_samples=%zu, fgd_samples=%zu\n",
+           bgdSamples.size(), fgdSamples.size());
+    // --- END DEBUG ---
     
     // Perform k-means clustering on background samples
     cv::Mat bgdCenters, fgdCenters;
@@ -313,6 +320,29 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
     if (mode == GC_INIT_WITH_RECT || mode == GC_INIT_WITH_MASK) {
         if (mode == GC_INIT_WITH_RECT) {
             initMaskWithRect(mask, m_imageSize, rect, stream);
+            
+            // --- BEGIN DEBUG: Inspect mask after initMaskWithRect ---
+            printf("\n[MetalGrabCut DEBUG] Inspecting mask state immediately after initMaskWithRect...\n");
+            stream.syncCPU(); // Ensure kernel is finished
+
+            cv::Mat h_init_mask;
+            mask.download(h_init_mask, stream, true);
+
+            int sure_bg = 0, sure_fg = 0, pr_bg = 0, pr_fg = 0, other = 0;
+            for (int y = 0; y < h_init_mask.rows; ++y) {
+                for (int x = 0; x < h_init_mask.cols; ++x) {
+                    uchar val = h_init_mask.at<uchar>(y, x);
+                    if (val == cv::GC_BGD) sure_bg++;
+                    else if (val == cv::GC_FGD) sure_fg++;
+                    else if (val == cv::GC_PR_BGD) pr_bg++;
+                    else if (val == cv::GC_PR_FGD) pr_fg++;
+                    else other++;
+                }
+            }
+            printf("[MetalGrabCut DEBUG] Mask Counts: SureBG=%d, SureFG=%d, ProbBG=%d, ProbFG=%d, Other=%d\n\n",
+                   sure_bg, sure_fg, pr_bg, pr_fg, other);
+            // --- END DEBUG ---
+            
         } else {
             checkMask(image, mask);
         }
@@ -419,11 +449,121 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
             // No extractGMMParameters call here - parameters stay GPU-resident
             
             // DETAILED TRACKING: Show GMM parameters AFTER learning
+            // Debug: Extract and inspect GMM parameters
+            if (iter == 0 && useGpuGraphCut) {
+                stream.syncCPU();
+                
+                cv::Mat bgModel, fgModel;
+                m_gmm->extractGMMParameters(bgModel, fgModel);
+                
+                printf("[MetalGrabCut DEBUG] GMM Parameters after learning (iter %d):\n", iter);
+                
+                // CRITICAL FIX: Read as float, not double - GPU uses float!
+                const float* fgData = fgModel.ptr<float>(0);
+                const float* bgData = bgModel.ptr<float>(0);
+                
+                // GMM buffer layout from extractGMMParameters:
+                // [weights(5), means(15), covariances(45)] = 65 total floats
+                printf("  FG Model:\n");
+                for (int c = 0; c < 5; c++) {
+                    float weight = fgData[c];  // weights are first 5 values
+                    const float* mean = &fgData[5 + c * 3];  // means start at 5
+                    const float* cov = &fgData[5 + 15 + c * 9];  // covs start at 20
+                    
+                    printf("    Component %d: weight=%.6f, mean=(%.2f,%.2f,%.2f)\n", 
+                           c, weight, mean[0], mean[1], mean[2]);
+                    
+                    // Calculate covariance determinant
+                    float det = cov[0]*(cov[4]*cov[8]-cov[5]*cov[7]) -
+                                cov[1]*(cov[3]*cov[8]-cov[5]*cov[6]) +
+                                cov[2]*(cov[3]*cov[7]-cov[4]*cov[6]);
+                    printf("      Cov determinant: %.9f\n", det);
+                    
+                    // Check diagonal elements
+                    printf("      Cov diagonal: [%.6f, %.6f, %.6f]\n", cov[0], cov[4], cov[8]);
+                    
+                    if (det <= 1e-9) {
+                        printf("      WARNING: Singular or near-singular covariance!\n");
+                    }
+                }
+                
+                printf("  BG Model:\n"); 
+                for (int c = 0; c < 5; c++) {
+                    float weight = bgData[c];
+                    const float* mean = &bgData[5 + c * 3];
+                    printf("    Component %d: weight=%.6f, mean=(%.2f,%.2f,%.2f)\n", 
+                           c, weight, mean[0], mean[1], mean[2]);
+                }
+            }
             
         }
         
         // Compute unary potentials (data term) - still on same stream
         m_gmm->computeDataTerm(image, mask, m_bgTerm, m_fgTerm, stream);
+
+        // --- DEBUG: Dump unary term textures ---
+        if (iter == 0 && useGpuGraphCut)
+        {
+            printf("[MetalGrabCut DEBUG] Dumping unary term textures...\n");
+            stream.syncCPU(); // Ensure computeDataTerm is finished
+
+            cv::Mat h_bgTerm, h_fgTerm;
+            m_bgTerm.download(h_bgTerm, stream, true);
+            m_fgTerm.download(h_fgTerm, stream, true);
+
+            double bg_min, bg_max, fg_min, fg_max;
+            cv::minMaxLoc(h_bgTerm, &bg_min, &bg_max);
+            cv::minMaxLoc(h_fgTerm, &fg_min, &fg_max);
+
+            printf("[MetalGrabCut DEBUG] Unary BG cost (capacity from Source): min=%.6f, max=%.6f\n", bg_min, bg_max);
+            printf("[MetalGrabCut DEBUG] Unary FG cost (capacity to Sink):   min=%.6f, max=%.6f\n", fg_min, fg_max);
+
+            // --- BEGIN DETAILED UNARY COST ANALYSIS ---
+            cv::Mat h_mask;
+            mask.download(h_mask, stream, true);
+
+            std::vector<float> pr_fgd_bg_costs;
+            std::vector<float> pr_fgd_fg_costs;
+            int pr_fgd_count = 0;
+
+            for (int y = 0; y < h_mask.rows; ++y) {
+                for (int x = 0; x < h_mask.cols; ++x) {
+                    if (h_mask.at<uchar>(y, x) == cv::GC_PR_FGD) {
+                        pr_fgd_count++;
+                        pr_fgd_bg_costs.push_back(h_bgTerm.at<float>(y, x));
+                        pr_fgd_fg_costs.push_back(h_fgTerm.at<float>(y, x));
+                    }
+                }
+            }
+
+            if (pr_fgd_count > 0) {
+                double sum_bg_costs = 0, sum_fg_costs = 0;
+                float min_bg_cost = pr_fgd_bg_costs[0], max_bg_cost = pr_fgd_bg_costs[0];
+                float min_fg_cost = pr_fgd_fg_costs[0], max_fg_cost = pr_fgd_fg_costs[0];
+
+                for (float cost : pr_fgd_bg_costs) {
+                    sum_bg_costs += cost;
+                    if (cost < min_bg_cost) min_bg_cost = cost;
+                    if (cost > max_bg_cost) max_bg_cost = cost;
+                }
+                for (float cost : pr_fgd_fg_costs) {
+                    sum_fg_costs += cost;
+                    if (cost < min_fg_cost) min_fg_cost = cost;
+                    if (cost > max_fg_cost) max_fg_cost = cost;
+                }
+
+                double mean_bg_cost = sum_bg_costs / pr_fgd_count;
+                double mean_fg_cost = sum_fg_costs / pr_fgd_count;
+
+                printf("[MetalGrabCut DEBUG] Analysis for %d GC_PR_FGD pixels:\n", pr_fgd_count);
+                printf("[MetalGrabCut DEBUG]   - BG Cost (from Source):  min=%.4f, max=%.4f, mean=%.4f\n", min_bg_cost, max_bg_cost, mean_bg_cost);
+                printf("[MetalGrabCut DEBUG]   - FG Cost (to Sink):      min=%.4f, max=%.4f, mean=%.4f\n", min_fg_cost, max_fg_cost, mean_fg_cost);
+            } else {
+                printf("[MetalGrabCut DEBUG] No GC_PR_FGD pixels found for unary cost analysis.\n");
+            }
+            // --- END DETAILED UNARY COST ANALYSIS ---
+        }
+        // --- END DEBUG ---
         
         if (useGpuGraphCut) {
             // ---------------------------------------------------------------------------------
@@ -442,6 +582,77 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
                                         m_pairwiseWeights[1], m_pairwiseWeights[3],
                                         mask, lambda);
             printf("[MetalGrabCut] buildGraph returned\n");
+
+            // --- BEGIN DEBUG: Inspect graph state after buildGraph ---
+            if (iter == 0) {
+                printf("\n[MetalGrabCut DEBUG] Inspecting graph state after buildGraph...\n");
+                stream.syncCPU(); // Ensure buildGraph is finished
+
+                // Get buffers from solver
+                const MetalGraphCut& solver = *m_metalGraphCut;
+                id<MTLBuffer> nodeDataBuffer = solver.getNodeDataBufferForDebug();
+                id<MTLBuffer> terminalFlowBuffer = solver.getTerminalFlowBufferForDebug();
+                
+                // Define CPU-side structs to interpret buffer data
+                struct CpuNodeDataAtom {
+                    uint32_t excessBits;
+                    int32_t label;
+                };
+                struct CpuTerminalFlow {
+                    uint32_t to_source_bits;
+                    uint32_t to_sink_bits;
+                };
+
+                // Download buffers and initial mask
+                cv::Mat h_mask;
+                mask.download(h_mask, stream, true);
+                
+                NSUInteger nodeCount = image.cols() * image.rows();
+                CpuNodeDataAtom* nodeData = (CpuNodeDataAtom*)[nodeDataBuffer contents];
+                CpuTerminalFlow* termFlow = (CpuTerminalFlow*)[terminalFlowBuffer contents];
+
+                // Counters for analysis
+                int sure_bg_count = 0, sure_fg_count = 0, pr_bg_count = 0, pr_fg_count = 0;
+                double total_excess = 0.0;
+                int nodes_with_excess = 0;
+                int probable_nodes_with_excess = 0;
+                double total_sink_cap = 0.0, total_source_cap = 0.0;
+
+                for (NSUInteger i = 0; i < nodeCount; ++i) {
+                    uchar maskVal = h_mask.at<uchar>(i);
+                    float excess = *(float*)&nodeData[i].excessBits;
+                    float cap_to_sink = *(float*)&termFlow[i].to_sink_bits;
+                    
+                    // Count mask values
+                    if (maskVal == cv::GC_BGD) sure_bg_count++;
+                    else if (maskVal == cv::GC_FGD) sure_fg_count++;
+                    else if (maskVal == cv::GC_PR_BGD) pr_bg_count++;
+                    else if (maskVal == cv::GC_PR_FGD) pr_fg_count++;
+                    
+                    // Analyze excess flow
+                    if (excess > 1e-6f) {
+                        nodes_with_excess++;
+                        total_excess += excess;
+                        if (maskVal == cv::GC_PR_FGD || maskVal == cv::GC_PR_BGD) {
+                            probable_nodes_with_excess++;
+                        }
+                    }
+                    
+                    // Analyze terminal capacities
+                    // Note: fromSource capacity becomes initial excess, so we check that.
+                    // to_sink capacity is what we check from the terminal flow buffer.
+                    total_source_cap += excess;
+                    total_sink_cap += cap_to_sink;
+                }
+
+                printf("[MetalGrabCut DEBUG] Initial Mask Counts: SureBG=%d, SureFG=%d, ProbBG=%d, ProbFG=%d\n",
+                       sure_bg_count, sure_fg_count, pr_bg_count, pr_fg_count);
+                printf("[MetalGrabCut DEBUG] Initial Excess Flow: total=%.4f, nodes_with_excess=%d, probable_nodes_with_excess=%d\n",
+                       total_excess, nodes_with_excess, probable_nodes_with_excess);
+                printf("[MetalGrabCut DEBUG] Terminal Capacities: total_from_source=%.4f, total_to_sink=%.4f\n\n",
+                       total_source_cap, total_sink_cap);
+            }
+            // --- END DEBUG ---
 
             // The push-relabel algorithm for max-flow is highly iterative and must run
             // until it converges (i.e., no more "active" nodes with excess flow).

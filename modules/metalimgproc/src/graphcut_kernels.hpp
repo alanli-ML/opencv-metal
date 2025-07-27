@@ -105,45 +105,54 @@ kernel void buildGraphAtomKernel(texture2d<float, access::read> bgTerm [[texture
 
     // Handle hard constraints from the mask
     uint maskVal = mask.read(gid).x;
-
-    float unary_bg_cost = 0.0f; // Cost for this pixel being background
-    float unary_fg_cost = 0.0f; // Cost for this pixel being foreground
-
     float bg_from_tex = bgTerm.read(gid).x;
     float fg_from_tex = fgTerm.read(gid).x;
-
+    
+    // CORRECTED LOGIC FOR HARD CONSTRAINTS
+    float t_weight_to_sink = 0.0f;    // capacity to sink
+    float t_weight_from_source = 0.0f; // capacity from source
+    int initial_height = 0;
+    uint totalNodes = width * height;
+    
     // GrabCut mask values: GC_BGD=0, GC_FGD=1, GC_PR_BGD=2, GC_PR_FGD=3
-    if (maskVal == 0) { // Sure Background (GC_BGD)
-        // Force background: no cost for BG, infinite cost for FG
-        unary_bg_cost = 0.0f;
-        unary_fg_cost = lambda;
-    } else if (maskVal == 1) { // Sure Foreground (GC_FGD)
-        // Force foreground: infinite cost for BG, no cost for FG
-        unary_bg_cost = lambda;
-        unary_fg_cost = 0.0f;
+    if (maskVal == 0u) { // Sure Background (GC_BGD)
+        // Sure background: tied to sink with infinite capacity
+        t_weight_from_source = 0.0f;
+        t_weight_to_sink = lambda;
+        initial_height = 0; // Part of the sink
+    } else if (maskVal == 1u) { // Sure Foreground (GC_FGD)
+        // Sure foreground: receives flow from source
+        t_weight_from_source = lambda;
+        t_weight_to_sink = 0.0f;
+        initial_height = totalNodes; // Acts as source
     } else { // Probable BG/FG (GC_PR_BGD=2, GC_PR_FGD=3)
         // Use GMM-derived costs
-        unary_bg_cost = bg_from_tex;
-        unary_fg_cost = fg_from_tex;
+        // In the min-cut framework, a node is assigned to the FG set (S-set) if the
+        // edge to the T-sink is cut, and to the BG set (T-set) if the edge
+        // from the S-source is cut.
+        // - capacity(S->p) is the penalty for assigning p to BG. This is -log(P(p|BG)).
+        // - capacity(p->T) is the penalty for assigning p to FG. This is -log(P(p|FG)).
+        //
+        // For push-relabel, initial excess flow is capacity(S->p). We want probable
+        // FG pixels to have high excess flow. A probable FG pixel has a high -log(P(p|BG)).
+        t_weight_from_source = bg_from_tex; // Penalty for BG assignment.
+        t_weight_to_sink = fg_from_tex;     // Penalty for FG assignment.
+        
+        // Start probable nodes with excess at height 1 to enable pushing.
+        initial_height = (t_weight_from_source > 1e-6f) ? 1 : 0;
     }
-
-    // New graph cut mapping: Source=Foreground, Sink=Background
-    // - capacity from source to pixel = unary_bg_cost (penalty for pixel being BG)
-    // - capacity from pixel to sink = unary_fg_cost (penalty for pixel being FG)
-    // - initial excess = capacity from source = unary_bg_cost
-    fstore(&nodeAtom[idx].excessBits, unary_bg_cost);
-    // After preflow, residual capacity of reverse edge (pixel->source) is unary_bg_cost
-    fstore(capToSourceBuf + idx, unary_bg_cost);
-    // Initialize height. Nodes with initial excess start at height 1, others at 0.
-    // This allows them to immediately push flow to the sink (at height 0).
-    int initial_height = (unary_bg_cost > 1e-6f) ? 1 : 0;
+    
+    // Assign to buffers based on corrected logic
+    // Initial excess is the capacity from the source terminal
+    fstore(&nodeAtom[idx].excessBits, t_weight_from_source);
+    // Residual capacity of the reverse edge (pixel->source) is the initial capacity
+    fstore(capToSourceBuf + idx, t_weight_from_source);
+    // Initial height
     atomic_store_explicit(&nodeAtom[idx].label, initial_height, memory_order_relaxed);
-
+    
     // Terminal edge capacities
-    // to_sink: capacity from pixel to Sink. This is the penalty for being foreground.
-    // to_source: residual capacity from Sink to pixel. Initialized to 0.
-    fstore(&termBuf[idx].to_source, 0.0f);
-    fstore(&termBuf[idx].to_sink, unary_fg_cost);
+    fstore(&termBuf[idx].to_source, 0.0f); // Not used for pushing, just for final cut BFS
+    fstore(&termBuf[idx].to_sink, t_weight_to_sink);
 
     // Directions: 0:W, 1:NW, 2:N, 3:NE, 4:E, 5:SE, 6:S, 7:SW
     // Symmetrically initialize residual graph using the 4 provided weight maps.
@@ -246,7 +255,8 @@ kernel void globalRelabelBfsTraverseKernel(device NodeDataAtom* nodeBuf [[buffer
             if (neighLabel > myLabel + 1) { // Can be relabeled
                 int newLabel = myLabel + 1;
                 if (atomic_compare_exchange_weak_explicit(&nodeBuf[nIdx].label, &neighLabel, newLabel,
-                                                        memory_order_relaxed, memory_order_relaxed)) {
+                                                        memory_order_relaxed,
+                                                        memory_order_relaxed)) {
                     uint pos = atomic_fetch_add_explicit(nextCount, 1u, memory_order_relaxed);
                     levelOut[pos] = nIdx;
                 }
@@ -375,39 +385,46 @@ kernel void pushRelabelKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
         }
     }
 
-    // If still have excess, relabel and re-queue
+    // If still have excess, the node is still active. It must be re-queued,
+    // and may need to be relabeled.
     if (excess > 1e-6f) {
-        int minHeight = INT_MAX;
+        // Only relabel if the node is not a source node (height < totalNodes).
+        if (myHeight < (int)totalNodes) {
+            int minHeight = INT_MAX;
 
-        // Find minimum height among neighbors with positive residual capacity
-        for (uint k = 0; k < 8; ++k) {
-             int nx = int(x) + offsets[k].x;
-             int ny = int(y) + offsets[k].y;
-             if (nx < 0 || ny < 0 || nx >= int(width) || ny >= int(height)) continue;
-             uint nIdx = ny * width + nx;
+            // Find minimum height among neighbors with positive residual capacity
+            for (uint k = 0; k < 8; ++k) {
+                 int nx = int(x) + offsets[k].x;
+                 int ny = int(y) + offsets[k].y;
+                 if (nx < 0 || ny < 0 || nx >= int(width) || ny >= int(height)) continue;
+                 uint nIdx = ny * width + nx;
 
-            if (fload(&resBuf[idx].c[k]) > 1e-6f) {
-                minHeight = min(minHeight, atomic_load_explicit(&nodeBuf[nIdx].label, memory_order_relaxed));
+                if (fload(&resBuf[idx].c[k]) > 1e-6f) {
+                    minHeight = min(minHeight, atomic_load_explicit(&nodeBuf[nIdx].label, memory_order_relaxed));
+                }
+            }
+
+            // Also consider the sink (height 0)
+            if (fload(&termBuf[idx].to_sink) > 1e-6f) {
+                minHeight = min(minHeight, 0);
+            }
+
+            // Also consider the source (height totalNodes).
+            if (fload(capToSourceBuf + idx) > 1e-6f) {
+                minHeight = min(minHeight, int(totalNodes));
+            }
+
+            // Relabel: set height = min neighbor height + 1
+            if (minHeight < INT_MAX) {
+                // New height can be totalNodes+1 to push back to source
+                int newHeight = minHeight + 1;
+                atomic_store_explicit(&nodeBuf[idx].label, newHeight, memory_order_relaxed);
             }
         }
-
-        // Also consider the sink (height 0)
-        if (fload(&termBuf[idx].to_sink) > 1e-6f) {
-            minHeight = min(minHeight, 0);
-        }
-
-        // Also consider the source (height totalNodes).
-        if (fload(capToSourceBuf + idx) > 1e-6f) {
-            minHeight = min(minHeight, int(totalNodes));
-        }
-
-        // Relabel: set height = min neighbor height + 1
-        if (minHeight < INT_MAX) {
-            atomic_store_explicit(&nodeBuf[idx].label, minHeight + 1, memory_order_relaxed);
-            // Re-queue for next iteration ONLY if relabel was successful
-            uint pos = atomic_fetch_add_explicit(nextCount, 1u, memory_order_relaxed);
-            activeListOut[pos] = idx;
-        }
+        
+        // ALWAYS re-queue for next iteration if it's still active.
+        uint pos = atomic_fetch_add_explicit(nextCount, 1u, memory_order_relaxed);
+        activeListOut[pos] = idx;
     }
 }
 )";
@@ -447,47 +464,50 @@ kernel void gapRelabelKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
 }
 )";
 
-static const char* kGraphCutFinalCutBfsInitSrc = R"(
+static const char* kGraphCutFinalCutBfsInit_SourceSet_Src = R"(
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void finalCutBfsInitKernel(const device NodeDataAtom* nodeBuf [[buffer(0)]],
-                                 const device TerminalFlow* termBuf [[buffer(1)]],
-                                 device int* reachableLabels [[buffer(2)]],
-                                 device uint* bfsQueue [[buffer(3)]],
-                                 device atomic_uint* queueCount [[buffer(4)]],
-                                 constant uint& totalNodes [[buffer(5)]],
-                                 uint gid [[thread_position_in_grid]])
+kernel void finalCutBfsInit_SourceSet_Kernel(const device NodeDataAtom* nodeBuf [[buffer(0)]],
+                                             device int* reachableLabels [[buffer(1)]],
+                                             device uint* bfsQueue [[buffer(2)]],
+                                             device atomic_uint* queueCount [[buffer(3)]],
+                                             constant uint& totalNodes [[buffer(4)]],
+                                             uint gid [[thread_position_in_grid]])
 {
     if (gid >= totalNodes) return;
 
-    // Initialize all nodes as unreachable from sink (i.e. foreground)
+    // Initialize all nodes as unreachable from source (i.e. background)
     reachableLabels[gid] = 0;
 
-    // A node is in the T-set (background) if it's reachable from the sink.
-    // We seed the BFS with all nodes that have a residual capacity FROM sink TO node.
-    // After push-relabel, this is stored in to_source (the reverse edge).
-    if (fload(&termBuf[gid].to_source) > 1e-6f) {
-        reachableLabels[gid] = 1; // Mark as reachable from sink (background)
+    // In push-relabel, after convergence:
+    // - Nodes at height >= totalNodes are connected to source
+    // - Nodes at height 0 are connected to sink
+    // - Nodes at intermediate heights form the cut
+    int height = atomic_load_explicit(&nodeBuf[gid].label, memory_order_relaxed);
+    
+    // Seed BFS with nodes that are in the source set
+    if (height >= (int)totalNodes) {
+        reachableLabels[gid] = 1; // Mark as reachable from source (foreground)
         uint pos = atomic_fetch_add_explicit(queueCount, 1u, memory_order_relaxed);
         bfsQueue[pos] = gid;
     }
 }
 )";
 
-static const char* kGraphCutFinalCutBfsTraverseSrc = R"(
+static const char* kGraphCutFinalCutBfsTraverse_SourceSet_Src = R"(
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void finalCutBfsTraverseKernel(const device uint* levelIn [[buffer(0)]],
-                                     constant uint& levelInCount [[buffer(1)]],
-                                     const device ResidualGraphAtom* resBuf [[buffer(2)]],
-                                     device int* reachableLabels [[buffer(3)]],
-                                     device atomic_uint* nextCount [[buffer(4)]],
-                                     device uint* levelOut [[buffer(5)]],
-                                     constant uint& width [[buffer(6)]],
-                                     constant uint& height [[buffer(7)]],
-                                     uint gid [[thread_position_in_grid]])
+kernel void finalCutBfsTraverse_SourceSet_Kernel(const device uint* levelIn [[buffer(0)]],
+                                                 constant uint& levelInCount [[buffer(1)]],
+                                                 const device ResidualGraphAtom* resBuf [[buffer(2)]],
+                                                 device int* reachableLabels [[buffer(3)]],
+                                                 device atomic_uint* nextCount [[buffer(4)]],
+                                                 device uint* levelOut [[buffer(5)]],
+                                                 constant uint& width [[buffer(6)]],
+                                                 constant uint& height [[buffer(7)]],
+                                                 uint gid [[thread_position_in_grid]])
 {
     if (gid >= levelInCount) return;
     uint idx = levelIn[gid];
@@ -495,7 +515,9 @@ kernel void finalCutBfsTraverseKernel(const device uint* levelIn [[buffer(0)]],
     uint x = idx % width;
     uint y = idx / width;
 
-    // Check 8-connected neighbors for forward edges with positive residual capacity
+    // To find all nodes in the S-set (foreground), we perform a forward traversal
+    // on the residual graph starting from nodes at source height. This finds all
+    // nodes reachable from the source.
     int2 offsets[8] = { int2(-1,0), int2(-1,-1), int2(0,-1), int2(1,-1),
                        int2(1,0), int2(1,1), int2(0,1), int2(-1,1) };
 
@@ -506,13 +528,12 @@ kernel void finalCutBfsTraverseKernel(const device uint* levelIn [[buffer(0)]],
         if (nx < 0 || nx >= int(width) || ny < 0 || ny >= int(height)) continue;
 
         uint nidx = ny * width + nx;
-        if (reachableLabels[nidx] != 0) continue; // Already reachable
+        if (reachableLabels[nidx] != 0) continue; // Already visited
 
         // Check residual capacity from current node to neighbor (forward edge).
+        // For source-set reachability, we traverse forward in the residual graph.
         float residual = fload(&resBuf[idx].c[k]);
 
-        // If there's positive residual capacity, the current node can reach the neighbor,
-        // so it is also part of the T-set.
         if (residual > 1e-6f) {
             int expected = 0;
             if (atomic_compare_exchange_weak_explicit((device atomic_int*)&reachableLabels[nidx], &expected, 1,
@@ -546,11 +567,12 @@ kernel void finalCutWriteMaskKernel(const device int* reachableLabels [[buffer(0
     if (initialMaskVal == 0u || initialMaskVal == 1u) { // Sure BGD or Sure FGD
         finalMaskVal = initialMaskVal;
     } else { // Probable BGD or Probable FGD
-        // A node is background if it is reachable from the sink terminal in the residual graph.
-        if (reachableLabels[idx] != 0) { // Reachable from sink -> Background
-            finalMaskVal = 2u; // GC_PR_BGD
-        } else { // Not reachable from sink -> Foreground
+        // With source-set reachability:
+        // A node is foreground if it is reachable from the source terminal in the residual graph.
+        if (reachableLabels[idx] != 0) { // Reachable from source -> Foreground
             finalMaskVal = 3u; // GC_PR_FGD
+        } else { // Not reachable from source -> Background
+            finalMaskVal = 2u; // GC_PR_BGD
         }
     }
     mask.write(finalMaskVal, gid);

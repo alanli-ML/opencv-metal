@@ -93,7 +93,7 @@ id<MTLComputePipelineState> MetalGraphCut::getPushRelabelPipeline()
         NSError* err = nil;
         s_pipeline = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
         if (!s_pipeline || err)
-            CV_Error(cv::Error::StsError, "Failed to create pushRelabelKernel pipeline");
+            CV_Error(cv::Error::StsError,"Failed to create pushRelabelKernel pipeline");
     }
     return s_pipeline;
 }
@@ -132,36 +132,36 @@ id<MTLComputePipelineState> MetalGraphCut::getGapRelabelPipeline()
     return s_pipeline;
 }
 
-id<MTLComputePipelineState> MetalGraphCut::getFinalCutBfsInitPipeline()
+id<MTLComputePipelineState> MetalGraphCut::getFinalCutBfsInit_SourceSet_Pipeline(id<MTLDevice> device)
 {
     static id<MTLComputePipelineState> s_pipeline = nil;
     if (!s_pipeline)
     {
         MetalContext& ctx = MetalContext::getInstance();
-        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutFinalCutBfsInitSrc;
-        id<MTLFunction> fn = ctx.getMetalFunction(src, "finalCutBfsInitKernel");
+        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutFinalCutBfsInit_SourceSet_Src;
+        id<MTLFunction> fn = ctx.getMetalFunction(src, "finalCutBfsInit_SourceSet_Kernel");
         if (!fn) return nil;
         NSError* err = nil;
         s_pipeline = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
         if (!s_pipeline || err)
-            CV_Error(cv::Error::StsError, "Failed to create finalCutBfsInitKernel pipeline");
+            CV_Error(cv::Error::StsError, "Failed to create finalCutBfsInit_SourceSet_Kernel pipeline");
     }
     return s_pipeline;
 }
 
-id<MTLComputePipelineState> MetalGraphCut::getFinalCutBfsTraversePipeline()
+id<MTLComputePipelineState> MetalGraphCut::getFinalCutBfsTraverse_SourceSet_Pipeline(id<MTLDevice> device)
 {
     static id<MTLComputePipelineState> s_pipeline = nil;
     if (!s_pipeline)
     {
         MetalContext& ctx = MetalContext::getInstance();
-        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutFinalCutBfsTraverseSrc;
-        id<MTLFunction> fn = ctx.getMetalFunction(src, "finalCutBfsTraverseKernel");
+        std::string src = std::string(kGraphCutCommonSrc) + kGraphCutFinalCutBfsTraverse_SourceSet_Src;
+        id<MTLFunction> fn = ctx.getMetalFunction(src, "finalCutBfsTraverse_SourceSet_Kernel");
         if (!fn) return nil;
         NSError* err = nil;
         s_pipeline = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
         if (!s_pipeline || err)
-            CV_Error(cv::Error::StsError, "Failed to create finalCutBfsTraverseKernel pipeline");
+            CV_Error(cv::Error::StsError, "Failed to create finalCutBfsTraverse_SourceSet_Kernel pipeline");
     }
     return s_pipeline;
 }
@@ -413,26 +413,19 @@ void MetalGraphCut::solve(int maxIterations)
         CV_Error(cv::Error::StsError, "Failed to get push-relabel pipeline");
         return;
     }
+    id<MTLComputePipelineState> histogramPipe = getBuildHeightHistogramPipeline();
+    id<MTLComputePipelineState> gapRelabelPipe = getGapRelabelPipeline();
 
     m_stream.syncCPU();
     uint32_t activeCount = *(uint32_t*)[m_levelCount contents];
-    printf("[MetalGraphCut DEBUG] Initial active nodes: %u\n", activeCount);
+    
     id<MTLBuffer> activeListIn = m_activeList1;
     id<MTLBuffer> activeListOut = m_activeList2;
 
     int iter = 0;
-    int globalRelabelFreq = std::max(1, (int)sqrt(totalNodes)); // Global relabel frequency
-
-    if (totalNodes > 10000) {
-        printf("[MetalGraphCut] Large graph: %u nodes, globalRelabelFreq=%d, maxIterations=%d\n", 
-               totalNodes, globalRelabelFreq, maxIterations);
-    }
-
-    for (iter = 0; iter < maxIterations; ++iter) {
-        if (activeCount == 0) {
-            printf("[MetalGraphCut DEBUG] Converged after %d iterations.\n", iter);
-            break;
-        }
+    
+    // Phase 1.1: Convert to while loop for true convergence
+    while (activeCount > 0 && iter < maxIterations) {
 
         // Reset output active counter using a non-blocking blit command
         @autoreleasepool {
@@ -441,9 +434,6 @@ void MetalGraphCut::solve(int maxIterations)
             [blitEnc endEncoding];
         }
         
-        if (iter < 5 || (totalNodes > 10000 && iter % 100 == 0)) {
-            printf("[MetalGraphCut DEBUG] Iteration %d: dispatching with activeCount=%u (stale)\n", iter, activeCount);
-        }
 
         @autoreleasepool {
             id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
@@ -467,30 +457,27 @@ void MetalGraphCut::solve(int maxIterations)
         }
 
         std::swap(activeListIn, activeListOut);
-
+        
+        // Synchronize to read the new active count
+        m_stream.syncCPU();
+        activeCount = *(uint32_t*)[m_levelCount contents];
+        
+        iter++;
+        
         // Heuristics serve as periodic sync points.
-        bool isGlobalRelabelTime = (iter > 0 && (iter + 1) % globalRelabelFreq == 0);
-        bool isGapRelabelTime = (iter > 0 && (iter + 1) % 10 == 0);
+        int globalRelabelFreq = std::max(1, (int)sqrt(totalNodes));
+        bool isGlobalRelabelTime = (iter > 0 && iter % globalRelabelFreq == 0);
+        bool isGapRelabelTime = (iter > 0 && iter % 10 == 0);
 
-        if (isGlobalRelabelTime) {
+        if (isGlobalRelabelTime && activeCount > 0) {
+            runGlobalRelabel();
+            createActiveList();
             m_stream.syncCPU();
             activeCount = *(uint32_t*)[m_levelCount contents];
-            if (activeCount > 0) {
-                printf("Running global relabel at iteration %d (activeCount=%u)\n", iter + 1, activeCount);
-                runGlobalRelabel();
-                createActiveList();
-                m_stream.syncCPU();
-                activeCount = *(uint32_t*)[m_levelCount contents];
-                activeListIn = m_activeList1;
-                activeListOut = m_activeList2;
-            }
+            activeListIn = m_activeList1;
+            activeListOut = m_activeList2;
         }
-        else if (isGapRelabelTime) {
-            m_stream.syncCPU();
-            activeCount = *(uint32_t*)[m_levelCount contents];
-            if (activeCount > 0) {
-                id<MTLComputePipelineState> histogramPipe = getBuildHeightHistogramPipeline();
-                id<MTLComputePipelineState> gapRelabelPipe = getGapRelabelPipeline();
+        else if (isGapRelabelTime && activeCount > 0) {
 
                 if (histogramPipe && gapRelabelPipe) {
                     // Clear histogram
@@ -566,207 +553,16 @@ void MetalGraphCut::solve(int maxIterations)
                     }
                 }
             }
-        }
     }
 
-    m_stream.syncCPU();
-    activeCount = *(uint32_t*)[m_levelCount contents];
-    printf("Push-relabel completed after %d iterations with %u active nodes remaining\n", iter, activeCount);
-
-    // --- DEBUG: Check terminal flow after solve ---
-    m_stream.syncCPU();
-
-    const CpuTerminalFlow* termFlow = (const CpuTerminalFlow*)[m_terminalFlow contents];
-    uint32_t source_connected_count = 0;
-    float min_to_source = 1e9f, max_to_source = 0.0f, sum_to_source = 0.0f;
-
-    for (NSUInteger i = 0; i < nodeCount; ++i) {
-        uint32_t source_bits = termFlow[i].to_source_bits;
-        float to_source_val;
-        memcpy(&to_source_val, &source_bits, sizeof(float));
-
-        if (to_source_val > 1e-6f) {
-            source_connected_count++;
-            if (to_source_val < min_to_source) min_to_source = to_source_val;
-            if (to_source_val > max_to_source) max_to_source = to_source_val;
-            sum_to_source += to_source_val;
-        }
+    // Log convergence status
+    if (activeCount == 0) {
+        printf("[MetalGraphCut] Converged after %d iterations\n", iter);
+    } else {
+        printf("[MetalGraphCut] Reached maximum iterations (%d) with %u active nodes remaining\n", iter, activeCount);
     }
-
-    printf("[MetalGraphCut DEBUG] After solve: %u / %lu nodes have residual capacity from sink (to_source > 0).\n",
-           source_connected_count, nodeCount);
-    if (source_connected_count > 0) {
-        printf("[MetalGraphCut DEBUG] to_source stats: min=%.4f, max=%.4f, avg=%.4f\n",
-               min_to_source, max_to_source, sum_to_source / source_connected_count);
-    }
-    
-    // --- DEBUG: Check residual graph ---
-    const CpuResidualGraphAtom* resGraph = (const CpuResidualGraphAtom*)[m_residualAtom contents];
-    uint32_t saturated_edges = 0;
-    uint32_t total_edges = 0;
-    float min_cap = 1e9f, max_cap = 0.0f;
-    
-    // Sample a few nodes and their edges
-    uint32_t sample_nodes = std::min(10u, totalNodes);
-    for (uint32_t i = 0; i < sample_nodes; ++i) {
-        for (int dir = 0; dir < 8; ++dir) {
-            uint32_t cap_bits = resGraph[i].c[dir];
-            float cap;
-            memcpy(&cap, &cap_bits, sizeof(float));
-            
-            total_edges++;
-            if (cap < 1e-6f) {
-                saturated_edges++;
-            } else {
-                if (cap < min_cap) min_cap = cap;
-                if (cap > max_cap) max_cap = cap;
-            }
-        }
-    }
-    
-    printf("[MetalGraphCut DEBUG] Residual graph sample: %u/%u edges saturated (near 0)\n",
-           saturated_edges, total_edges);
-    if (total_edges > saturated_edges) {
-        printf("[MetalGraphCut DEBUG] Non-saturated edge capacities: min=%.6f, max=%.6f\n",
-               min_cap, max_cap);
-    }
-    
-    // Print capacities for node 0 as an example
-    if (nodeCount > 0) {
-        printf("[MetalGraphCut DEBUG] Node 0 residual capacities (W,NW,N,NE,E,SE,S,SW): ");
-        for (int dir = 0; dir < 8; ++dir) {
-            uint32_t cap_bits = resGraph[0].c[dir];
-            float cap;
-            memcpy(&cap, &cap_bits, sizeof(float));
-            printf("%.4f ", cap);
-        }
-        printf("\n");
-    }
-    
-    // --- DEBUG: Check for nodes with excess flow ---
-    const CpuNodeDataAtom* nodeData = (const CpuNodeDataAtom*)[m_nodeDataAtom contents];
-    uint32_t nodes_with_excess = 0;
-    uint32_t stuck_nodes = 0;
-    float total_excess = 0.0f;
-    
-    for (NSUInteger i = 0; i < nodeCount; ++i) {
-        uint32_t excess_bits = nodeData[i].excessBits;
-        float excess;
-        memcpy(&excess, &excess_bits, sizeof(float));
-        
-        if (excess > 1e-6f) {
-            nodes_with_excess++;
-            total_excess += excess;
-            int height = nodeData[i].label;
-            
-            // Check if this node could have been relabeled
-            int minHeight = INT_MAX;
-            
-            // Check neighbors
-            uint32_t x = i % width;
-            uint32_t y = i / width;
-            
-            // First check if this is the stuck node and print its details
-            if (nodes_with_excess <= 5) {
-                printf("[MetalGraphCut DEBUG] Node %lu with excess %.6f at height %d, pos (%u,%u)\n",
-                       i, excess, height, x, y);
-            }
-            for (int dir = 0; dir < 8; ++dir) {
-                int nx = x;
-                int ny = y;
-                // Directions: 0:W, 1:NW, 2:N, 3:NE, 4:E, 5:SE, 6:S, 7:SW
-                switch(dir) {
-                    case 0: nx -= 1; break;           // W
-                    case 1: nx -= 1; ny -= 1; break;  // NW
-                    case 2: ny -= 1; break;           // N
-                    case 3: nx += 1; ny -= 1; break;  // NE
-                    case 4: nx += 1; break;           // E
-                    case 5: nx += 1; ny += 1; break;  // SE
-                    case 6: ny += 1; break;           // S
-                    case 7: nx -= 1; ny += 1; break;  // SW
-                }
-                
-                if (nx >= 0 && nx < (int)width && ny >= 0 && ny < (int)height) {
-                    uint32_t nidx = ny * width + nx;
-                    uint32_t cap_bits = resGraph[i].c[dir];
-                    float cap;
-                    memcpy(&cap, &cap_bits, sizeof(float));
-                    
-                    if (cap > 1e-6f) {
-                        int neighHeight = nodeData[nidx].label;
-                        if (neighHeight < minHeight) {
-                            minHeight = neighHeight;
-                        }
-                    }
-                }
-            }
-            
-            // Check sink
-            uint32_t sink_cap_bits = termFlow[i].to_sink_bits;
-            float sink_cap;
-            memcpy(&sink_cap, &sink_cap_bits, sizeof(float));
-            if (sink_cap > 1e-6f) {
-                minHeight = std::min(minHeight, 0); // Sink has height 0
-            }
-            
-            // Check source (capToSourceBuf is defined later, need to check it separately)
-            
-            if (minHeight == INT_MAX) {
-                stuck_nodes++;
-                if (stuck_nodes <= 5) {
-                    printf("[MetalGraphCut DEBUG] Stuck node %lu: excess=%.6f, height=%d, no valid neighbors\n",
-                           i, excess, height);
-                    // Check source capacity for this stuck node
-                    const float* capToSourcePtr = (const float*)[m_capToSourceBuf contents];
-                    float source_cap = capToSourcePtr[i];
-                    printf("  - Residual capacity to source: %.6f\n", source_cap);
-                }
-            } else if (nodes_with_excess <= 5) {
-                printf("  - Min neighbor height found: %d (would relabel to %d)\n",
-                       minHeight, minHeight + 1);
-                // Check source capacity
-                const float* capToSourcePtr = (const float*)[m_capToSourceBuf contents];
-                float source_cap = capToSourcePtr[i];
-                printf("  - Residual capacity to source: %.6f (source height=%u)\n",
-                       source_cap, totalNodes);
-                if (source_cap > 1e-6f && minHeight >= (int)totalNodes) {
-                    printf("  - Node CAN push to source after relabel to height %d\n", minHeight + 1);
-                }
-            }
-        }
-    }
-    
-    printf("[MetalGraphCut DEBUG] Nodes with excess flow: %u / %u (total excess=%.6f)\n",
-           nodes_with_excess, totalNodes, total_excess);
-    if (nodes_with_excess > 0) {
-        printf("[MetalGraphCut DEBUG] Stuck nodes (no valid relabel): %u / %u\n",
-               stuck_nodes, nodes_with_excess);
-    }
-    
-    // --- DEBUG: Check capToSourceBuf ---
-    const float* capToSource = (const float*)[m_capToSourceBuf contents];
-    uint32_t nodes_with_source_cap = 0;
-    float total_source_cap = 0.0f;
-    float min_source_cap = 1e9f, max_source_cap = 0.0f;
-    
-    for (NSUInteger i = 0; i < nodeCount; ++i) {
-        float cap = capToSource[i];
-        if (cap > 1e-6f) {
-            nodes_with_source_cap++;
-            total_source_cap += cap;
-            if (cap < min_source_cap) min_source_cap = cap;
-            if (cap > max_source_cap) max_source_cap = cap;
-        }
-    }
-    
-    printf("[MetalGraphCut DEBUG] Nodes with residual capacity to source: %u / %u\n",
-           nodes_with_source_cap, totalNodes);
-    if (nodes_with_source_cap > 0) {
-        printf("[MetalGraphCut DEBUG] Source capacity stats: min=%.6f, max=%.6f, total=%.6f\n",
-               min_source_cap, max_source_cap, total_source_cap);
-    }
-    // --- END DEBUG ---
 }
+
 
 void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask)
 {
@@ -777,8 +573,8 @@ void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask
     uint32_t height = (uint32_t)m_graphSize.height;
     uint32_t totalNodes = width * height;
 
-    // 1. Initialize BFS: Find nodes on source-side of cut and add to initial queue
-    id<MTLComputePipelineState> bfsInitPipe = getFinalCutBfsInitPipeline();
+    // 1. Initialize BFS: Find nodes at source height and add to initial queue
+    id<MTLComputePipelineState> bfsInitPipe = getFinalCutBfsInit_SourceSet_Pipeline(MetalContext::getInstance().device);
     CV_Assert(bfsInitPipe);
 
     uint32_t zero = 0;
@@ -787,13 +583,18 @@ void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
         [enc setComputePipelineState:bfsInitPipe];
+        
+        // Source-set BFS init arguments (simplified)
+        // Buffers
         [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
-        [enc setBuffer:m_terminalFlow offset:0 atIndex:1];   // Pass the terminal flow buffer
-        [enc setBuffer:m_finalCutLabels offset:0 atIndex:2]; // Shifted from 1
-        [enc setBuffer:m_activeList1 offset:0 atIndex:3];    // Shifted from 2 - BFS queue
-        [enc setBuffer:m_levelCount offset:0 atIndex:4];     // Shifted from 3
-        [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:5]; // Shifted from 4
+        [enc setBuffer:m_finalCutLabels offset:0 atIndex:1];
+        [enc setBuffer:m_activeList1 offset:0 atIndex:2];    // BFS queue
+        [enc setBuffer:m_levelCount offset:0 atIndex:3];
+        
+        // Constants
+        [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:4];
 
+        // Dispatch 1D over all nodes
         MTLSize tg = MTLSizeMake(256, 1, 1);
         MTLSize grid = MTLSizeMake((totalNodes + tg.width - 1) / tg.width, 1, 1);
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
@@ -801,12 +602,13 @@ void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask
     }
 
     // 2. Traverse graph with BFS to find all source-reachable nodes
-    id<MTLComputePipelineState> bfsTraversePipe = getFinalCutBfsTraversePipeline();
+    id<MTLComputePipelineState> bfsTraversePipe = getFinalCutBfsTraverse_SourceSet_Pipeline(MetalContext::getInstance().device);
     CV_Assert(bfsTraversePipe);
 
     m_stream.syncCPU();
     uint32_t queueCount = *(uint32_t*)[m_levelCount contents];
-    printf("[GraphCut Final BFS] Initial sink-connected nodes: %u\n", queueCount);
+    printf("[GraphCut Final BFS] Initial source-connected nodes: %u\n", queueCount);
+    
     id<MTLBuffer> currentQueue = m_activeList1;
     id<MTLBuffer> nextQueue = m_activeList2;
 
@@ -847,19 +649,8 @@ void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask
             reachable_count++;
         }
     }
-    printf("[MetalGraphCut DEBUG] After BFS: %u / %u nodes are reachable from sink.\n",
+    printf("[MetalGraphCut DEBUG] After BFS: %u / %u nodes are reachable from source.\n",
            reachable_count, totalNodes);
-    if (reachable_count > 0 && reachable_count < 20) {
-        printf("[MetalGraphCut DEBUG] Reachable node indices: ");
-        int printed_count = 0;
-        for (NSUInteger i = 0; i < totalNodes && printed_count < 20; ++i) {
-            if (reachableLabels[i] != 0) {
-                printf("%lu ", i);
-                printed_count++;
-            }
-        }
-        printf("\n");
-    }
     // --- END DEBUG ---
 
     // 3. Write final mask, preserving sure regions from initial_mask
