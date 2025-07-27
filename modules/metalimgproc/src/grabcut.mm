@@ -436,16 +436,19 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
             }
 
             // Build the graph directly on the GPU from unary & pairwise terms
+            printf("[MetalGrabCut] Calling buildGraph for %dx%d image\n", image.cols(), image.rows());
             m_metalGraphCut->buildGraph(m_bgTerm, m_fgTerm,
                                         m_pairwiseWeights[0], m_pairwiseWeights[2],
                                         m_pairwiseWeights[1], m_pairwiseWeights[3],
                                         mask, lambda);
+            printf("[MetalGrabCut] buildGraph returned\n");
 
             // The push-relabel algorithm for max-flow is highly iterative and must run
             // until it converges (i.e., no more "active" nodes with excess flow).
             // We provide a generous iteration limit as a safeguard; the solver in
             // graphcut.mm is designed to terminate early once convergence is reached.
-            const int maxFlowIterations = 2000;
+            // Note: Some nodes may need to relabel to height totalNodes+1 to push to source
+            const int maxFlowIterations = std::max(4000, (int)(10 * std::sqrt(mask.cols() * mask.rows())));
             m_metalGraphCut->solve(maxFlowIterations);
 
             // Retrieve updated mask (GPU → GPU). Note: getSegmentation writes into
@@ -643,6 +646,9 @@ namespace {
 void grabCut(InputArray _img, InputOutputArray _mask, Rect rect,
              InputOutputArray _bgdModel, InputOutputArray _fgdModel,
              int iterCount, int mode, bool useGpuGraphCut, Stream& stream) {
+    
+    printf("[cv::metal::grabCut] Entry - image %dx%d, iterCount=%d, mode=%d, useGpuGraphCut=%d\n",
+           _img.cols(), _img.rows(), iterCount, mode, useGpuGraphCut);
     
     CV_Assert(!_img.empty());
     CV_Assert(_img.type() == CV_8UC3);

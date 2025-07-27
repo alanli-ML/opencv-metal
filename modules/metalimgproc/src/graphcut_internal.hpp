@@ -84,6 +84,7 @@ private:
     // --- Atomics refactor buffers (slice 1) ---
     id<MTLBuffer> m_nodeDataAtom   = nil; // NodeDataAtom array (atomic excess+label)
     id<MTLBuffer> m_residualAtom   = nil; // Residual4Atom array (atomic neighbour caps)
+    id<MTLBuffer> m_capToSourceBuf = nil; // Residual capacity from pixel to source
 
     // Texture references for provisional segmentation
     id<MTLTexture> m_bgTermTex = nil;

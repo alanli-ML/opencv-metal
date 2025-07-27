@@ -196,8 +196,11 @@ void MetalGraphCut::runGlobalRelabel()
     id<MTLComputePipelineState> globalRelabelInitPipe = getGlobalRelabelInitPipeline();
     CV_Assert(globalRelabelInitPipe);
 
-    uint32_t zero = 0;
-    memcpy([m_levelCount contents], &zero, sizeof(uint32_t));
+    @autoreleasepool {
+        id<MTLBlitCommandEncoder> blitEnc = StreamAccessor::createBlitEncoder(m_stream);
+        [blitEnc fillBuffer:m_levelCount range:NSMakeRange(0, sizeof(uint32_t)) value:0];
+        [blitEnc endEncoding];
+    }
 
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
@@ -223,7 +226,11 @@ void MetalGraphCut::runGlobalRelabel()
     
     uint32_t bfsIter = 0;
     while (queueCount > 0 && bfsIter < (width + height)) { // Limit BFS iterations
-        memcpy([m_levelCount contents], &zero, sizeof(uint32_t));
+        @autoreleasepool {
+            id<MTLBlitCommandEncoder> blitEnc = StreamAccessor::createBlitEncoder(m_stream);
+            [blitEnc fillBuffer:m_levelCount range:NSMakeRange(0, sizeof(uint32_t)) value:0];
+            [blitEnc endEncoding];
+        }
         
         @autoreleasepool {
             id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
@@ -257,8 +264,11 @@ void MetalGraphCut::createActiveList()
     id<MTLComputePipelineState> createActivePipe = getCreateInitialActiveListPipeline();
     CV_Assert(createActivePipe);
 
-    uint32_t zero = 0;
-    memcpy([m_levelCount contents], &zero, sizeof(uint32_t));
+    @autoreleasepool {
+        id<MTLBlitCommandEncoder> blitEnc = StreamAccessor::createBlitEncoder(m_stream);
+        [blitEnc fillBuffer:m_levelCount range:NSMakeRange(0, sizeof(uint32_t)) value:0];
+        [blitEnc endEncoding];
+    }
 
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
@@ -274,6 +284,20 @@ void MetalGraphCut::createActiveList()
     }
 }
 
+struct CpuTerminalFlow {
+    uint32_t to_source_bits;
+    uint32_t to_sink_bits;
+};
+
+struct CpuResidualGraphAtom {
+    uint32_t c[8];  // Capacities for 8 directions as float bits
+};
+
+struct CpuNodeDataAtom {
+    uint32_t excessBits;  // float bits
+    int32_t label;
+};
+
 MetalGraphCut::MetalGraphCut(cv::Size sz, Stream& s)
     : m_stream(s), m_graphSize(sz)
 {
@@ -288,7 +312,7 @@ void MetalGraphCut::allocateGraphBuffers()
     NSUInteger count = m_graphSize.width * m_graphSize.height;
 
     if (!m_terminalFlow)
-        m_terminalFlow = [dev newBufferWithLength:count * sizeof(float) * 2
+        m_terminalFlow = [dev newBufferWithLength:count * sizeof(CpuTerminalFlow)
                                           options:MTLResourceStorageModeShared];
 
     // Active node buffers (ping-pong buffers for push-relabel)
@@ -315,7 +339,7 @@ void MetalGraphCut::allocateGraphBuffers()
     // Final cut reachability labels
     if (!m_finalCutLabels)
         m_finalCutLabels = [dev newBufferWithLength:count * sizeof(int32_t)
-                                            options:MTLResourceStorageModePrivate];
+                                            options:MTLResourceStorageModeShared];
 
     // Slice 1: allocate atomic buffers (NodeDataAtom 8 bytes, ResidualGraphAtom 32 bytes)
     if (!m_nodeDataAtom)
@@ -323,7 +347,10 @@ void MetalGraphCut::allocateGraphBuffers()
                                           options:MTLResourceStorageModeShared];
     if (!m_residualAtom)
         m_residualAtom = [dev newBufferWithLength:count * 32
-                                          options:MTLResourceStorageModePrivate];
+                                          options:MTLResourceStorageModeShared];
+    if (!m_capToSourceBuf)
+        m_capToSourceBuf = [dev newBufferWithLength:count * sizeof(float)
+                                           options:MTLResourceStorageModeShared];
 }
 
 void MetalGraphCut::buildGraph(const MetalMat& unary_bg,
@@ -360,6 +387,7 @@ void MetalGraphCut::buildGraph(const MetalMat& unary_bg,
 
         float lambdaFloat = (float)lambda;
         [enc setBytes:&lambdaFloat length:sizeof(float) atIndex:3];
+        [enc setBuffer:m_capToSourceBuf offset:0 atIndex:4];
 
         MTLSize tg=MTLSizeMake(16,16,1);
         MTLSize grid=MTLSizeMake((m_graphSize.width+15)/16,(m_graphSize.height+15)/16,1);
@@ -375,121 +403,48 @@ void MetalGraphCut::solve(int maxIterations)
     uint32_t totalNodes = (uint32_t)nodeCount;
     uint32_t width = (uint32_t)m_graphSize.width;
     uint32_t height = (uint32_t)m_graphSize.height;
-    
-    // Phase 1: Global relabel initialization
-    id<MTLComputePipelineState> globalRelabelInitPipe = getGlobalRelabelInitPipeline();
-    if (!globalRelabelInitPipe) {
-        CV_Error(cv::Error::StsError, "Failed to get global relabel init pipeline");
-        return;
-    }
-    
-    // Reset queue counter
-    uint32_t zero = 0;
-    memcpy([m_levelCount contents], &zero, sizeof(uint32_t));
-    
-    // Initialize heights and create initial BFS frontier
-    @autoreleasepool {
-        id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
-        [enc setComputePipelineState:globalRelabelInitPipe];
-        [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
-        [enc setBuffer:m_terminalFlow offset:0 atIndex:1];
-        [enc setBuffer:m_activeList1 offset:0 atIndex:2]; // BFS queue
-        [enc setBuffer:m_levelCount offset:0 atIndex:3];   // Queue counter
-        [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:4];
-        
-        MTLSize tg = MTLSizeMake(256, 1, 1);
-        MTLSize grid = MTLSizeMake((totalNodes + tg.width - 1) / tg.width, 1, 1);
-        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
-        [enc endEncoding];
-    }
-    
-    // Phase 1: BFS traversal for global relabel
-    id<MTLComputePipelineState> globalRelabelBfsPipe = getGlobalRelabelBfsTraversePipeline();
-    if (!globalRelabelBfsPipe) {
-        CV_Error(cv::Error::StsError, "Failed to get global relabel BFS pipeline");
-        return;
-    }
-    
-    m_stream.syncCPU();
-    uint32_t queueCount = *(uint32_t*)[m_levelCount contents];
-    id<MTLBuffer> currentQueue = m_activeList1;
-    id<MTLBuffer> nextQueue = m_activeList2;
-    
-    uint32_t bfsIter = 0;
-    while (queueCount > 0 && bfsIter < 1000) {
-        // Reset next queue counter
-        uint32_t zero = 0;
-        memcpy([m_levelCount contents], &zero, sizeof(uint32_t));
-        
-        @autoreleasepool {
-            id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
-            [enc setComputePipelineState:globalRelabelBfsPipe];
-            [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
-            [enc setBuffer:m_residualAtom offset:0 atIndex:1];
-            [enc setBuffer:currentQueue offset:0 atIndex:2];
-            [enc setBytes:&queueCount length:sizeof(uint32_t) atIndex:3];
-            [enc setBuffer:m_levelCount offset:0 atIndex:4]; // Next queue counter
-            [enc setBuffer:nextQueue offset:0 atIndex:5];
-            [enc setBytes:&width length:sizeof(uint32_t) atIndex:6];
-            [enc setBytes:&height length:sizeof(uint32_t) atIndex:7];
-            
-            MTLSize tg = MTLSizeMake(256, 1, 1);
-            MTLSize grid = MTLSizeMake((queueCount + tg.width - 1) / tg.width, 1, 1);
-            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
-            [enc endEncoding];
-        }
-        
-        m_stream.syncCPU();
-        queueCount = *(uint32_t*)[m_levelCount contents];
-        std::swap(currentQueue, nextQueue);
-        ++bfsIter;
-    }
-    
+
     // Phase 1: Create initial active list from nodes with excess flow
-    id<MTLComputePipelineState> createActivePipe = getCreateInitialActiveListPipeline();
-    if (!createActivePipe) {
-        CV_Error(cv::Error::StsError, "Failed to get create active list pipeline");
-        return;
-    }
-    
-    // Reset active counter
-    memcpy([m_levelCount contents], &zero, sizeof(uint32_t));
-    
-    @autoreleasepool {
-        id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
-        [enc setComputePipelineState:createActivePipe];
-        [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
-        [enc setBuffer:m_activeList1 offset:0 atIndex:1]; // Active list
-        [enc setBuffer:m_levelCount offset:0 atIndex:2];   // Active counter
-        [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:3];
-        
-        MTLSize tg = MTLSizeMake(256, 1, 1);
-        MTLSize grid = MTLSizeMake((totalNodes + tg.width - 1) / tg.width, 1, 1);
-        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
-        [enc endEncoding];
-    }
-    
+    createActiveList();
+
     // Phase 2: Main push-relabel loop
     id<MTLComputePipelineState> pushRelabelPipe = getPushRelabelPipeline();
     if (!pushRelabelPipe) {
         CV_Error(cv::Error::StsError, "Failed to get push-relabel pipeline");
         return;
     }
-    
+
     m_stream.syncCPU();
     uint32_t activeCount = *(uint32_t*)[m_levelCount contents];
     printf("[MetalGraphCut DEBUG] Initial active nodes: %u\n", activeCount);
     id<MTLBuffer> activeListIn = m_activeList1;
     id<MTLBuffer> activeListOut = m_activeList2;
-    
+
     int iter = 0;
     int globalRelabelFreq = std::max(1, (int)sqrt(totalNodes)); // Global relabel frequency
-    
-    while (activeCount > 0 && iter < maxIterations) {
-        // Reset output active counter
-        uint32_t zero = 0;
-        memcpy([m_levelCount contents], &zero, sizeof(uint32_t));
+
+    if (totalNodes > 10000) {
+        printf("[MetalGraphCut] Large graph: %u nodes, globalRelabelFreq=%d, maxIterations=%d\n", 
+               totalNodes, globalRelabelFreq, maxIterations);
+    }
+
+    for (iter = 0; iter < maxIterations; ++iter) {
+        if (activeCount == 0) {
+            printf("[MetalGraphCut DEBUG] Converged after %d iterations.\n", iter);
+            break;
+        }
+
+        // Reset output active counter using a non-blocking blit command
+        @autoreleasepool {
+            id<MTLBlitCommandEncoder> blitEnc = StreamAccessor::createBlitEncoder(m_stream);
+            [blitEnc fillBuffer:m_levelCount range:NSMakeRange(0, sizeof(uint32_t)) value:0];
+            [blitEnc endEncoding];
+        }
         
+        if (iter < 5 || (totalNodes > 10000 && iter % 100 == 0)) {
+            printf("[MetalGraphCut DEBUG] Iteration %d: dispatching with activeCount=%u (stale)\n", iter, activeCount);
+        }
+
         @autoreleasepool {
             id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
             [enc setComputePipelineState:pushRelabelPipe];
@@ -502,111 +457,315 @@ void MetalGraphCut::solve(int maxIterations)
             [enc setBuffer:activeListOut offset:0 atIndex:6];
             [enc setBytes:&width length:sizeof(uint32_t) atIndex:7];
             [enc setBytes:&height length:sizeof(uint32_t) atIndex:8];
-            
+            [enc setBuffer:m_capToSourceBuf offset:0 atIndex:9]; // Residual capacity to source
+            [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:10]; // Total nodes for height calculations
+
             MTLSize tg = MTLSizeMake(256, 1, 1);
             MTLSize grid = MTLSizeMake((activeCount + tg.width - 1) / tg.width, 1, 1);
             [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
             [enc endEncoding];
         }
-        
-        m_stream.syncCPU();
-        activeCount = *(uint32_t*)[m_levelCount contents];
+
         std::swap(activeListIn, activeListOut);
-        ++iter;
-        
-        // Phase 3: Periodic global relabel for better convergence
-        if (iter > 0 && iter % globalRelabelFreq == 0 && activeCount > 0) {
-            printf("Running global relabel at iteration %d (activeCount=%u)\n", iter, activeCount);
-            runGlobalRelabel();
-            createActiveList();
+
+        // Heuristics serve as periodic sync points.
+        bool isGlobalRelabelTime = (iter > 0 && (iter + 1) % globalRelabelFreq == 0);
+        bool isGapRelabelTime = (iter > 0 && (iter + 1) % 10 == 0);
+
+        if (isGlobalRelabelTime) {
             m_stream.syncCPU();
             activeCount = *(uint32_t*)[m_levelCount contents];
-            activeListIn = m_activeList1;
-            activeListOut = m_activeList2;
-        }
-        
-        // Phase 3: Gap heuristic optimization
-        if (iter % 10 == 0 && activeCount > 0) { // Check gaps every 10 iterations
-            id<MTLComputePipelineState> histogramPipe = getBuildHeightHistogramPipeline();
-            id<MTLComputePipelineState> gapRelabelPipe = getGapRelabelPipeline();
-            
-            if (histogramPipe && gapRelabelPipe) {
-                // Clear histogram
-                @autoreleasepool {
-                    id<MTLBlitCommandEncoder> blitEnc = StreamAccessor::createBlitEncoder(m_stream);
-                    [blitEnc fillBuffer:m_heightHistogram range:NSMakeRange(0, totalNodes * sizeof(uint32_t)) value:0];
-                    [blitEnc endEncoding];
-                }
-                
-                // Build height histogram
-                @autoreleasepool {
-                    id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
-                    [enc setComputePipelineState:histogramPipe];
-                    [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
-                    [enc setBuffer:m_heightHistogram offset:0 atIndex:1];
-                    [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:2];
-                    
-                    MTLSize tg = MTLSizeMake(256, 1, 1);
-                    MTLSize grid = MTLSizeMake((totalNodes + tg.width - 1) / tg.width, 1, 1);
-                    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
-                    [enc endEncoding];
-                }
-                
-                // Gap detection: find gaps in height histogram
+            if (activeCount > 0) {
+                printf("Running global relabel at iteration %d (activeCount=%u)\n", iter + 1, activeCount);
+                runGlobalRelabel();
+                createActiveList();
                 m_stream.syncCPU();
-                
-                // Read histogram data and find gaps
-                uint32_t* histogram = (uint32_t*)[m_heightHistogram contents];
-                bool foundGap = false;
-                uint32_t gapHeight = 0;
-                
-                // Look for gaps (heights with zero nodes that have higher heights with nodes)
-                for (uint32_t h = 1; h < totalNodes - 1; ++h) {
-                    if (histogram[h] == 0) {
-                        // Check if there are nodes at higher levels
-                        bool hasHigherNodes = false;
-                        for (uint32_t h2 = h + 1; h2 < totalNodes; ++h2) {
-                            if (histogram[h2] > 0) {
-                                hasHigherNodes = true;
-                                break;
-                            }
-                        }
-                        if (hasHigherNodes) {
-                            foundGap = true;
-                            gapHeight = h;
-                            break;
-                        }
+                activeCount = *(uint32_t*)[m_levelCount contents];
+                activeListIn = m_activeList1;
+                activeListOut = m_activeList2;
+            }
+        }
+        else if (isGapRelabelTime) {
+            m_stream.syncCPU();
+            activeCount = *(uint32_t*)[m_levelCount contents];
+            if (activeCount > 0) {
+                id<MTLComputePipelineState> histogramPipe = getBuildHeightHistogramPipeline();
+                id<MTLComputePipelineState> gapRelabelPipe = getGapRelabelPipeline();
+
+                if (histogramPipe && gapRelabelPipe) {
+                    // Clear histogram
+                    @autoreleasepool {
+                        id<MTLBlitCommandEncoder> blitEnc = StreamAccessor::createBlitEncoder(m_stream);
+                        [blitEnc fillBuffer:m_heightHistogram range:NSMakeRange(0, totalNodes * sizeof(uint32_t)) value:0];
+                        [blitEnc endEncoding];
                     }
-                }
-                
-                // Apply gap relabel if gap found
-                if (foundGap) {
-                    printf("Gap found at height %u, applying gap relabel\n", gapHeight);
+
+                    // Build height histogram
                     @autoreleasepool {
                         id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
-                        [enc setComputePipelineState:gapRelabelPipe];
+                        [enc setComputePipelineState:histogramPipe];
                         [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
-                        [enc setBytes:&gapHeight length:sizeof(uint32_t) atIndex:1];
+                        [enc setBuffer:m_heightHistogram offset:0 atIndex:1];
                         [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:2];
-                        
+
                         MTLSize tg = MTLSizeMake(256, 1, 1);
                         MTLSize grid = MTLSizeMake((totalNodes + tg.width - 1) / tg.width, 1, 1);
                         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
                         [enc endEncoding];
                     }
-                    
-                    // Recreate active list after gap relabel
-                    createActiveList();
+
+                    // Gap detection: find gaps in height histogram
                     m_stream.syncCPU();
-                    activeCount = *(uint32_t*)[m_levelCount contents];
-                    activeListIn = m_activeList1;
-                    activeListOut = m_activeList2;
+
+                    // Read histogram data and find gaps
+                    uint32_t* histogram = (uint32_t*)[m_heightHistogram contents];
+                    bool foundGap = false;
+                    uint32_t gapHeight = 0;
+
+                    // Look for gaps (heights with zero nodes that have higher heights with nodes)
+                    for (uint32_t h = 1; h < totalNodes - 1; ++h) {
+                        if (histogram[h] == 0) {
+                            // Check if there are nodes at higher levels
+                            bool hasHigherNodes = false;
+                            for (uint32_t h2 = h + 1; h2 < totalNodes; ++h2) {
+                                if (histogram[h2] > 0) {
+                                    hasHigherNodes = true;
+                                    break;
+                                }
+                            }
+                            if (hasHigherNodes) {
+                                foundGap = true;
+                                gapHeight = h;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Apply gap relabel if gap found
+                    if (foundGap) {
+                        printf("Gap found at height %u, applying gap relabel\n", gapHeight);
+                        @autoreleasepool {
+                            id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
+                            [enc setComputePipelineState:gapRelabelPipe];
+                            [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
+                            [enc setBytes:&gapHeight length:sizeof(uint32_t) atIndex:1];
+                            [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:2];
+
+                            MTLSize tg = MTLSizeMake(256, 1, 1);
+                            MTLSize grid = MTLSizeMake((totalNodes + tg.width - 1) / tg.width, 1, 1);
+                            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+                            [enc endEncoding];
+                        }
+
+                        // Recreate active list after gap relabel
+                        createActiveList();
+                        m_stream.syncCPU();
+                        activeCount = *(uint32_t*)[m_levelCount contents];
+                        activeListIn = m_activeList1;
+                        activeListOut = m_activeList2;
+                    }
+                }
+            }
+        }
+    }
+
+    m_stream.syncCPU();
+    activeCount = *(uint32_t*)[m_levelCount contents];
+    printf("Push-relabel completed after %d iterations with %u active nodes remaining\n", iter, activeCount);
+
+    // --- DEBUG: Check terminal flow after solve ---
+    m_stream.syncCPU();
+
+    const CpuTerminalFlow* termFlow = (const CpuTerminalFlow*)[m_terminalFlow contents];
+    uint32_t source_connected_count = 0;
+    float min_to_source = 1e9f, max_to_source = 0.0f, sum_to_source = 0.0f;
+
+    for (NSUInteger i = 0; i < nodeCount; ++i) {
+        uint32_t source_bits = termFlow[i].to_source_bits;
+        float to_source_val;
+        memcpy(&to_source_val, &source_bits, sizeof(float));
+
+        if (to_source_val > 1e-6f) {
+            source_connected_count++;
+            if (to_source_val < min_to_source) min_to_source = to_source_val;
+            if (to_source_val > max_to_source) max_to_source = to_source_val;
+            sum_to_source += to_source_val;
+        }
+    }
+
+    printf("[MetalGraphCut DEBUG] After solve: %u / %lu nodes have residual capacity from sink (to_source > 0).\n",
+           source_connected_count, nodeCount);
+    if (source_connected_count > 0) {
+        printf("[MetalGraphCut DEBUG] to_source stats: min=%.4f, max=%.4f, avg=%.4f\n",
+               min_to_source, max_to_source, sum_to_source / source_connected_count);
+    }
+    
+    // --- DEBUG: Check residual graph ---
+    const CpuResidualGraphAtom* resGraph = (const CpuResidualGraphAtom*)[m_residualAtom contents];
+    uint32_t saturated_edges = 0;
+    uint32_t total_edges = 0;
+    float min_cap = 1e9f, max_cap = 0.0f;
+    
+    // Sample a few nodes and their edges
+    uint32_t sample_nodes = std::min(10u, totalNodes);
+    for (uint32_t i = 0; i < sample_nodes; ++i) {
+        for (int dir = 0; dir < 8; ++dir) {
+            uint32_t cap_bits = resGraph[i].c[dir];
+            float cap;
+            memcpy(&cap, &cap_bits, sizeof(float));
+            
+            total_edges++;
+            if (cap < 1e-6f) {
+                saturated_edges++;
+            } else {
+                if (cap < min_cap) min_cap = cap;
+                if (cap > max_cap) max_cap = cap;
+            }
+        }
+    }
+    
+    printf("[MetalGraphCut DEBUG] Residual graph sample: %u/%u edges saturated (near 0)\n",
+           saturated_edges, total_edges);
+    if (total_edges > saturated_edges) {
+        printf("[MetalGraphCut DEBUG] Non-saturated edge capacities: min=%.6f, max=%.6f\n",
+               min_cap, max_cap);
+    }
+    
+    // Print capacities for node 0 as an example
+    if (nodeCount > 0) {
+        printf("[MetalGraphCut DEBUG] Node 0 residual capacities (W,NW,N,NE,E,SE,S,SW): ");
+        for (int dir = 0; dir < 8; ++dir) {
+            uint32_t cap_bits = resGraph[0].c[dir];
+            float cap;
+            memcpy(&cap, &cap_bits, sizeof(float));
+            printf("%.4f ", cap);
+        }
+        printf("\n");
+    }
+    
+    // --- DEBUG: Check for nodes with excess flow ---
+    const CpuNodeDataAtom* nodeData = (const CpuNodeDataAtom*)[m_nodeDataAtom contents];
+    uint32_t nodes_with_excess = 0;
+    uint32_t stuck_nodes = 0;
+    float total_excess = 0.0f;
+    
+    for (NSUInteger i = 0; i < nodeCount; ++i) {
+        uint32_t excess_bits = nodeData[i].excessBits;
+        float excess;
+        memcpy(&excess, &excess_bits, sizeof(float));
+        
+        if (excess > 1e-6f) {
+            nodes_with_excess++;
+            total_excess += excess;
+            int height = nodeData[i].label;
+            
+            // Check if this node could have been relabeled
+            int minHeight = INT_MAX;
+            
+            // Check neighbors
+            uint32_t x = i % width;
+            uint32_t y = i / width;
+            
+            // First check if this is the stuck node and print its details
+            if (nodes_with_excess <= 5) {
+                printf("[MetalGraphCut DEBUG] Node %lu with excess %.6f at height %d, pos (%u,%u)\n",
+                       i, excess, height, x, y);
+            }
+            for (int dir = 0; dir < 8; ++dir) {
+                int nx = x;
+                int ny = y;
+                // Directions: 0:W, 1:NW, 2:N, 3:NE, 4:E, 5:SE, 6:S, 7:SW
+                switch(dir) {
+                    case 0: nx -= 1; break;           // W
+                    case 1: nx -= 1; ny -= 1; break;  // NW
+                    case 2: ny -= 1; break;           // N
+                    case 3: nx += 1; ny -= 1; break;  // NE
+                    case 4: nx += 1; break;           // E
+                    case 5: nx += 1; ny += 1; break;  // SE
+                    case 6: ny += 1; break;           // S
+                    case 7: nx -= 1; ny += 1; break;  // SW
+                }
+                
+                if (nx >= 0 && nx < (int)width && ny >= 0 && ny < (int)height) {
+                    uint32_t nidx = ny * width + nx;
+                    uint32_t cap_bits = resGraph[i].c[dir];
+                    float cap;
+                    memcpy(&cap, &cap_bits, sizeof(float));
+                    
+                    if (cap > 1e-6f) {
+                        int neighHeight = nodeData[nidx].label;
+                        if (neighHeight < minHeight) {
+                            minHeight = neighHeight;
+                        }
+                    }
+                }
+            }
+            
+            // Check sink
+            uint32_t sink_cap_bits = termFlow[i].to_sink_bits;
+            float sink_cap;
+            memcpy(&sink_cap, &sink_cap_bits, sizeof(float));
+            if (sink_cap > 1e-6f) {
+                minHeight = std::min(minHeight, 0); // Sink has height 0
+            }
+            
+            // Check source (capToSourceBuf is defined later, need to check it separately)
+            
+            if (minHeight == INT_MAX) {
+                stuck_nodes++;
+                if (stuck_nodes <= 5) {
+                    printf("[MetalGraphCut DEBUG] Stuck node %lu: excess=%.6f, height=%d, no valid neighbors\n",
+                           i, excess, height);
+                    // Check source capacity for this stuck node
+                    const float* capToSourcePtr = (const float*)[m_capToSourceBuf contents];
+                    float source_cap = capToSourcePtr[i];
+                    printf("  - Residual capacity to source: %.6f\n", source_cap);
+                }
+            } else if (nodes_with_excess <= 5) {
+                printf("  - Min neighbor height found: %d (would relabel to %d)\n",
+                       minHeight, minHeight + 1);
+                // Check source capacity
+                const float* capToSourcePtr = (const float*)[m_capToSourceBuf contents];
+                float source_cap = capToSourcePtr[i];
+                printf("  - Residual capacity to source: %.6f (source height=%u)\n",
+                       source_cap, totalNodes);
+                if (source_cap > 1e-6f && minHeight >= (int)totalNodes) {
+                    printf("  - Node CAN push to source after relabel to height %d\n", minHeight + 1);
                 }
             }
         }
     }
     
-    printf("Push-relabel completed after %d iterations with %u active nodes remaining\n", iter, activeCount);
+    printf("[MetalGraphCut DEBUG] Nodes with excess flow: %u / %u (total excess=%.6f)\n",
+           nodes_with_excess, totalNodes, total_excess);
+    if (nodes_with_excess > 0) {
+        printf("[MetalGraphCut DEBUG] Stuck nodes (no valid relabel): %u / %u\n",
+               stuck_nodes, nodes_with_excess);
+    }
+    
+    // --- DEBUG: Check capToSourceBuf ---
+    const float* capToSource = (const float*)[m_capToSourceBuf contents];
+    uint32_t nodes_with_source_cap = 0;
+    float total_source_cap = 0.0f;
+    float min_source_cap = 1e9f, max_source_cap = 0.0f;
+    
+    for (NSUInteger i = 0; i < nodeCount; ++i) {
+        float cap = capToSource[i];
+        if (cap > 1e-6f) {
+            nodes_with_source_cap++;
+            total_source_cap += cap;
+            if (cap < min_source_cap) min_source_cap = cap;
+            if (cap > max_source_cap) max_source_cap = cap;
+        }
+    }
+    
+    printf("[MetalGraphCut DEBUG] Nodes with residual capacity to source: %u / %u\n",
+           nodes_with_source_cap, totalNodes);
+    if (nodes_with_source_cap > 0) {
+        printf("[MetalGraphCut DEBUG] Source capacity stats: min=%.6f, max=%.6f, total=%.6f\n",
+               min_source_cap, max_source_cap, total_source_cap);
+    }
+    // --- END DEBUG ---
 }
 
 void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask)
@@ -629,10 +788,11 @@ void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask
         id<MTLComputeCommandEncoder> enc = StreamAccessor::createComputeEncoder(m_stream);
         [enc setComputePipelineState:bfsInitPipe];
         [enc setBuffer:m_nodeDataAtom offset:0 atIndex:0];
-        [enc setBuffer:m_finalCutLabels offset:0 atIndex:1];
-        [enc setBuffer:m_activeList1 offset:0 atIndex:2]; // BFS queue
-        [enc setBuffer:m_levelCount offset:0 atIndex:3];
-        [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:4];
+        [enc setBuffer:m_terminalFlow offset:0 atIndex:1];   // Pass the terminal flow buffer
+        [enc setBuffer:m_finalCutLabels offset:0 atIndex:2]; // Shifted from 1
+        [enc setBuffer:m_activeList1 offset:0 atIndex:3];    // Shifted from 2 - BFS queue
+        [enc setBuffer:m_levelCount offset:0 atIndex:4];     // Shifted from 3
+        [enc setBytes:&totalNodes length:sizeof(uint32_t) atIndex:5]; // Shifted from 4
 
         MTLSize tg = MTLSizeMake(256, 1, 1);
         MTLSize grid = MTLSizeMake((totalNodes + tg.width - 1) / tg.width, 1, 1);
@@ -646,6 +806,7 @@ void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask
 
     m_stream.syncCPU();
     uint32_t queueCount = *(uint32_t*)[m_levelCount contents];
+    printf("[GraphCut Final BFS] Initial sink-connected nodes: %u\n", queueCount);
     id<MTLBuffer> currentQueue = m_activeList1;
     id<MTLBuffer> nextQueue = m_activeList2;
 
@@ -676,6 +837,30 @@ void MetalGraphCut::getSegmentation(MetalMat& mask, const MetalMat& initial_mask
         std::swap(currentQueue, nextQueue);
         bfsIter++;
     }
+
+    // --- DEBUG: Check reachable labels after BFS ---
+    m_stream.syncCPU();
+    const int32_t* reachableLabels = (const int32_t*)[m_finalCutLabels contents];
+    uint32_t reachable_count = 0;
+    for (NSUInteger i = 0; i < totalNodes; ++i) {
+        if (reachableLabels[i] != 0) {
+            reachable_count++;
+        }
+    }
+    printf("[MetalGraphCut DEBUG] After BFS: %u / %u nodes are reachable from sink.\n",
+           reachable_count, totalNodes);
+    if (reachable_count > 0 && reachable_count < 20) {
+        printf("[MetalGraphCut DEBUG] Reachable node indices: ");
+        int printed_count = 0;
+        for (NSUInteger i = 0; i < totalNodes && printed_count < 20; ++i) {
+            if (reachableLabels[i] != 0) {
+                printf("%lu ", i);
+                printed_count++;
+            }
+        }
+        printf("\n");
+    }
+    // --- END DEBUG ---
 
     // 3. Write final mask, preserving sure regions from initial_mask
     id<MTLComputePipelineState> writeMaskPipe = getFinalCutWriteMaskPipeline();
