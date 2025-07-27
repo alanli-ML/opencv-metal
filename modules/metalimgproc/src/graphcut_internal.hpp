@@ -59,6 +59,10 @@ public:
      */
     void getSegmentation(MetalMat& mask, const MetalMat& initial_mask);
 
+    // DEBUG: Expose buffers for external inspection
+    id<MTLBuffer> getNodeDataBufferForDebug() const { return m_nodeDataAtom; }
+    id<MTLBuffer> getTerminalFlowBufferForDebug() const { return m_terminalFlow; }
+
 private:
     // We deliberately keep the member list minimal for now – additional GPU
     // buffers and pipeline states will be introduced with subsequent commits.
@@ -115,8 +119,8 @@ private:
     static id<MTLComputePipelineState> getPushRelabelPipeline();
     static id<MTLComputePipelineState> getBuildHeightHistogramPipeline();
     static id<MTLComputePipelineState> getGapRelabelPipeline();
-    static id<MTLComputePipelineState> getFinalCutBfsInitPipeline();
-    static id<MTLComputePipelineState> getFinalCutBfsTraversePipeline();
+    static id<MTLComputePipelineState> getFinalCutBfsInit_SourceSet_Pipeline(id<MTLDevice> device);
+    static id<MTLComputePipelineState> getFinalCutBfsTraverse_SourceSet_Pipeline(id<MTLDevice> device);
     static id<MTLComputePipelineState> getFinalCutWriteMaskPipeline();
     static id<MTLComputePipelineState> getSimpleFinalCutPipeline();
 };

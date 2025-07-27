@@ -450,7 +450,7 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
             
             // DETAILED TRACKING: Show GMM parameters AFTER learning
             // Debug: Extract and inspect GMM parameters
-            if (iter == 0 && useGpuGraphCut) {
+            if (false && iter == 0 && useGpuGraphCut) { // Disable debug for now
                 stream.syncCPU();
                 
                 cv::Mat bgModel, fgModel;
@@ -502,7 +502,7 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         m_gmm->computeDataTerm(image, mask, m_bgTerm, m_fgTerm, stream);
 
         // --- DEBUG: Dump unary term textures ---
-        if (iter == 0 && useGpuGraphCut)
+        if (false && iter == 0 && useGpuGraphCut) // Disable debug for now
         {
             printf("[MetalGrabCut DEBUG] Dumping unary term textures...\n");
             stream.syncCPU(); // Ensure computeDataTerm is finished
@@ -584,7 +584,7 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
             printf("[MetalGrabCut] buildGraph returned\n");
 
             // --- BEGIN DEBUG: Inspect graph state after buildGraph ---
-            if (iter == 0) {
+            if (false && iter == 0) { // Disable debug for now
                 printf("\n[MetalGrabCut DEBUG] Inspecting graph state after buildGraph...\n");
                 stream.syncCPU(); // Ensure buildGraph is finished
 

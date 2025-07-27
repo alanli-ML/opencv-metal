@@ -236,7 +236,7 @@ static void initializeUtilityPipelines() {
             } else if (!g_trimapFromRectPipeline) {
                 NSLog(@"trimapFromRectKernel pipeline is nil");
             } else {
-                NSLog(@"trimapFromRectKernel pipeline created successfully");
+                // Pipeline created successfully - no need to log every time
             }
             
             id<MTLFunction> edgeCuesFunc = [library newFunctionWithName:@"edgeCuesKernel"];
