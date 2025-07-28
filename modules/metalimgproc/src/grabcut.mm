@@ -403,7 +403,7 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
                 betaBuffer, gamma, stream);
     
     // Keep the synchronous beta for legacy compatibility (only sync when needed)
-    m_beta = calcBeta(image, stream);
+    // m_beta = calcBeta(image, stream);
     
     if (iterCount <= 0) return;
     
@@ -687,9 +687,9 @@ void GrabCutImpl::run(const MetalMat& image, MetalMat& mask, const Rect& rect,
         }
         
         // Check for convergence
-        if (checkConvergence(m_prevMask, mask, stream)) {
-            break;
-        }
+        // if (checkConvergence(m_prevMask, mask, stream)) {
+        //     break;
+        // }
     }
     
     // Phase 4: Extract final GMM parameters after all iterations complete

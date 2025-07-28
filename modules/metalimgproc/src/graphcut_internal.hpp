@@ -72,15 +72,11 @@ private:
     // --- Buffers for upcoming push-relabel implementation ---
     id<MTLBuffer> m_terminalFlow  = nil; // source/sink capacities
 
-    // BFS traversal buffers / Active Lists (ping-pong)
-    id<MTLBuffer> m_activeList1    = nil;
-    id<MTLBuffer> m_activeList2    = nil;
-    id<MTLBuffer> m_levelCount   = nil; // uint[1] counter for active list size
-
     id<MTLBuffer> m_excessFlag   = nil; // uint[1] flag for push-relabel convergence
     
     // Phase 3 Optimization buffers
     id<MTLBuffer> m_heightHistogram = nil;
+    id<MTLBuffer> m_gapInfo         = nil; // uint[1] for gap height
     
     // Phase 4 Final cut buffers
     id<MTLBuffer> m_finalCutLabels  = nil; // int array for final BFS reachability
@@ -99,7 +95,6 @@ private:
 
     // Phase 3 Optimization helpers
     void runGlobalRelabel();
-    void createActiveList();
 
     // Lazy-initialised compute pipeline for the provisional segmentation pass.
     static id<MTLComputePipelineState> getSimpleSegmentationPipeline();
@@ -115,9 +110,9 @@ private:
     // New pipelines for push-relabel and optimizations
     static id<MTLComputePipelineState> getGlobalRelabelInitPipeline();
     static id<MTLComputePipelineState> getGlobalRelabelBfsTraversePipeline();
-    static id<MTLComputePipelineState> getCreateInitialActiveListPipeline();
     static id<MTLComputePipelineState> getPushRelabelPipeline();
     static id<MTLComputePipelineState> getBuildHeightHistogramPipeline();
+    static id<MTLComputePipelineState> getFindGapPipeline();
     static id<MTLComputePipelineState> getGapRelabelPipeline();
     static id<MTLComputePipelineState> getFinalCutBfsInit_SourceSet_Pipeline(id<MTLDevice> device);
     static id<MTLComputePipelineState> getFinalCutBfsTraverse_SourceSet_Pipeline(id<MTLDevice> device);

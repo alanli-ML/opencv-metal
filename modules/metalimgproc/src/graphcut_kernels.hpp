@@ -179,9 +179,8 @@ using namespace metal;
 
 kernel void globalRelabelInitKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
                                    device TerminalFlow* termBuf [[buffer(1)]],
-                                   device uint* bfsQueue [[buffer(2)]],
-                                   device atomic_uint* queueCount [[buffer(3)]],
-                                   constant uint& totalNodes [[buffer(4)]],
+                                   // Removed bfsQueue and queueCount
+                                   constant uint& totalNodes [[buffer(2)]],
                                    uint gid [[thread_position_in_grid]])
 {
     if (gid >= totalNodes) return;
@@ -203,8 +202,7 @@ kernel void globalRelabelInitKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
     // Seed BFS with nodes that have residual capacity TO sink.
     if (fload(&termBuf[gid].to_sink) > 1e-6f) {
         atomic_store_explicit(&nodeBuf[gid].label, 1, memory_order_relaxed);
-        uint pos = atomic_fetch_add_explicit(queueCount, 1u, memory_order_relaxed);
-        bfsQueue[pos] = gid;
+        // No longer need to write to a queue
     }
 }
 )";
@@ -215,19 +213,19 @@ using namespace metal;
 
 kernel void globalRelabelBfsTraverseKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
                                           const device ResidualGraphAtom* resBuf [[buffer(1)]],
-                                          const device uint* levelIn [[buffer(2)]],
-                                          constant uint& levelInCount [[buffer(3)]],
-                                          device atomic_uint* nextCount [[buffer(4)]],
-                                          device uint* levelOut [[buffer(5)]],
-                                          constant uint& width [[buffer(6)]],
-                                          constant uint& height [[buffer(7)]],
+                                          constant uint& current_bfs_level [[buffer(2)]],
+                                          constant uint& width [[buffer(3)]],
+                                          constant uint& height [[buffer(4)]],
+                                          constant uint& totalNodes [[buffer(5)]],
                                           uint gid [[thread_position_in_grid]])
 {
-    if (gid >= levelInCount) return;
-    uint idx = levelIn[gid];
+    if (gid >= totalNodes) return;
+    uint idx = gid;
 
     int myLabel = atomic_load_explicit(&nodeBuf[idx].label, memory_order_relaxed);
-    if (myLabel <= 0) return;
+    
+    // Only threads whose label matches the current BFS level do work.
+    if (myLabel != (int)current_bfs_level) return;
 
     uint x = idx % width;
     uint y = idx / width;
@@ -252,36 +250,15 @@ kernel void globalRelabelBfsTraverseKernel(device NodeDataAtom* nodeBuf [[buffer
 
         if (cap > 1e-6f) {
             int neighLabel = atomic_load_explicit(&nodeBuf[nIdx].label, memory_order_relaxed);
-            if (neighLabel > myLabel + 1) { // Can be relabeled
+            // If neighbor is unvisited (or can be reached by a shorter path)
+            if (neighLabel > myLabel + 1) {
                 int newLabel = myLabel + 1;
-                if (atomic_compare_exchange_weak_explicit(&nodeBuf[nIdx].label, &neighLabel, newLabel,
+                // Try to claim this neighbor for the next level
+                atomic_compare_exchange_weak_explicit(&nodeBuf[nIdx].label, &neighLabel, newLabel,
                                                         memory_order_relaxed,
-                                                        memory_order_relaxed)) {
-                    uint pos = atomic_fetch_add_explicit(nextCount, 1u, memory_order_relaxed);
-                    levelOut[pos] = nIdx;
-                }
+                                                        memory_order_relaxed);
             }
         }
-    }
-}
-)";
-
-static const char* kGraphCutCreateActiveListSrc = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void createInitialActiveListKernel(const device NodeDataAtom* nodeBuf [[buffer(0)]],
-                                         device uint* activeList [[buffer(1)]],
-                                         device atomic_uint* activeCount [[buffer(2)]],
-                                         constant uint& totalNodes [[buffer(3)]],
-                                         uint gid [[thread_position_in_grid]])
-{
-    if (gid >= totalNodes) return;
-
-    float excess = fload(&nodeBuf[gid].excessBits);
-    if (excess > 1e-6f) {
-        uint pos = atomic_fetch_add_explicit(activeCount, 1u, memory_order_relaxed);
-        activeList[pos] = gid;
     }
 }
 )";
@@ -293,18 +270,14 @@ using namespace metal;
 kernel void pushRelabelKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
                              device ResidualGraphAtom* resBuf [[buffer(1)]],
                              device TerminalFlow* termBuf [[buffer(2)]],
-                             const device uint* activeListIn [[buffer(3)]],
-                             constant uint& activeCount [[buffer(4)]],
-                             device atomic_uint* nextCount [[buffer(5)]],
-                             device uint* activeListOut [[buffer(6)]],
-                             constant uint& width [[buffer(7)]],
-                             constant uint& height [[buffer(8)]],
-                             device atomic_uint* capToSourceBuf [[buffer(9)]],
-                             constant uint& totalNodes [[buffer(10)]],
+                             constant uint& width [[buffer(3)]],
+                             constant uint& height [[buffer(4)]],
+                             device atomic_uint* capToSourceBuf [[buffer(5)]],
+                             constant uint& totalNodes [[buffer(6)]],
                              uint gid [[thread_position_in_grid]])
 {
-    if (gid >= activeCount) return;
-    uint idx = activeListIn[gid];
+    if (gid >= totalNodes) return;
+    uint idx = gid;
 
     float excess = fload(&nodeBuf[idx].excessBits);
     if (excess <= 1e-6f) return; // Not active
@@ -369,24 +342,17 @@ kernel void pushRelabelKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
 
             // Atomically update excesses
             fsub(&nodeBuf[idx].excessBits, delta);
-            float oldNeighExcess = fadd(&nodeBuf[nIdx].excessBits, delta);
+            fadd(&nodeBuf[nIdx].excessBits, delta);
 
             // Atomically update residual capacities for forward and reverse edges
             fsub(&resBuf[idx].c[k], delta);
             fadd(&resBuf[nIdx].c[reverse_dir[k]], delta);
 
             excess -= delta;
-
-            // If neighbor became active, add it to the next active list
-            if (oldNeighExcess <= 1e-6f) {
-                uint pos = atomic_fetch_add_explicit(nextCount, 1u, memory_order_relaxed);
-                activeListOut[pos] = nIdx;
-            }
         }
     }
 
-    // If still have excess, the node is still active. It must be re-queued,
-    // and may need to be relabeled.
+    // If still have excess, the node may need to be relabeled.
     if (excess > 1e-6f) {
         // Only relabel if the node is not a source node (height < totalNodes).
         if (myHeight < (int)totalNodes) {
@@ -421,10 +387,6 @@ kernel void pushRelabelKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
                 atomic_store_explicit(&nodeBuf[idx].label, newHeight, memory_order_relaxed);
             }
         }
-        
-        // ALWAYS re-queue for next iteration if it's still active.
-        uint pos = atomic_fetch_add_explicit(nextCount, 1u, memory_order_relaxed);
-        activeListOut[pos] = idx;
     }
 }
 )";
@@ -447,16 +409,53 @@ kernel void buildHeightHistogramKernel(const device NodeDataAtom* nodeBuf [[buff
 }
 )";
 
+static const char* kGraphCutFindGapSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+// This kernel is dispatched with a single thread.
+// It scans the histogram to find the first gap.
+kernel void findGapKernel(const device uint* histogram [[buffer(0)]],
+                         device atomic_uint* gapHeightOut [[buffer(1)]],
+                         constant uint& totalNodes [[buffer(2)]])
+{
+    // Find the first height h > 0 where histogram[h] is 0 but some h2 > h is not.
+    for (uint h = 1; h < totalNodes - 1; ++h) {
+        if (histogram[h] == 0) {
+            // Found a potential gap, now confirm there's a node at a higher level.
+            bool hasHigherNodes = false;
+            for (uint h2 = h + 1; h2 < totalNodes; ++h2) {
+                if (histogram[h2] > 0) {
+                    hasHigherNodes = true;
+                    break;
+                }
+            }
+            if (hasHigherNodes) {
+                // This is a valid gap. Store it and terminate.
+                atomic_store_explicit(gapHeightOut, h, memory_order_relaxed);
+                return;
+            }
+        }
+    }
+    // No gap found, ensure output is 0.
+    atomic_store_explicit(gapHeightOut, 0u, memory_order_relaxed);
+}
+)";
+
 static const char* kGraphCutGapRelabelSrc = R"(
 #include <metal_stdlib>
 using namespace metal;
 
 kernel void gapRelabelKernel(device NodeDataAtom* nodeBuf [[buffer(0)]],
-                            constant uint& gapHeight [[buffer(1)]],
+                            const device atomic_uint* gapHeightBuf [[buffer(1)]],
                             constant uint& totalNodes [[buffer(2)]],
                             uint gid [[thread_position_in_grid]])
 {
     if (gid >= totalNodes) return;
+
+    uint gapHeight = atomic_load_explicit(gapHeightBuf, memory_order_relaxed);
+    if (gapHeight == 0) return; // No gap was found
+
     int height = atomic_load_explicit(&nodeBuf[gid].label, memory_order_relaxed);
     if (height > int(gapHeight)) {
         atomic_store_explicit(&nodeBuf[gid].label, totalNodes, memory_order_relaxed);
@@ -470,9 +469,8 @@ using namespace metal;
 
 kernel void finalCutBfsInit_SourceSet_Kernel(const device NodeDataAtom* nodeBuf [[buffer(0)]],
                                              device int* reachableLabels [[buffer(1)]],
-                                             device uint* bfsQueue [[buffer(2)]],
-                                             device atomic_uint* queueCount [[buffer(3)]],
-                                             constant uint& totalNodes [[buffer(4)]],
+                                             // Removed bfsQueue and queueCount
+                                             constant uint& totalNodes [[buffer(2)]],
                                              uint gid [[thread_position_in_grid]])
 {
     if (gid >= totalNodes) return;
@@ -488,9 +486,8 @@ kernel void finalCutBfsInit_SourceSet_Kernel(const device NodeDataAtom* nodeBuf 
     
     // Seed BFS with nodes that are in the source set
     if (height >= (int)totalNodes) {
-        reachableLabels[gid] = 1; // Mark as reachable from source (foreground)
-        uint pos = atomic_fetch_add_explicit(queueCount, 1u, memory_order_relaxed);
-        bfsQueue[pos] = gid;
+        reachableLabels[gid] = 1; // Mark as reachable from source (foreground) for level 1
+        // No longer need to write to a queue
     }
 }
 )";
@@ -499,18 +496,19 @@ static const char* kGraphCutFinalCutBfsTraverse_SourceSet_Src = R"(
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void finalCutBfsTraverse_SourceSet_Kernel(const device uint* levelIn [[buffer(0)]],
-                                                 constant uint& levelInCount [[buffer(1)]],
-                                                 const device ResidualGraphAtom* resBuf [[buffer(2)]],
-                                                 device int* reachableLabels [[buffer(3)]],
-                                                 device atomic_uint* nextCount [[buffer(4)]],
-                                                 device uint* levelOut [[buffer(5)]],
-                                                 constant uint& width [[buffer(6)]],
-                                                 constant uint& height [[buffer(7)]],
+kernel void finalCutBfsTraverse_SourceSet_Kernel(const device ResidualGraphAtom* resBuf [[buffer(0)]],
+                                                 device int* reachableLabels [[buffer(1)]],
+                                                 constant uint& current_bfs_level [[buffer(2)]],
+                                                 constant uint& width [[buffer(3)]],
+                                                 constant uint& height [[buffer(4)]],
+                                                 constant uint& totalNodes [[buffer(5)]],
                                                  uint gid [[thread_position_in_grid]])
 {
-    if (gid >= levelInCount) return;
-    uint idx = levelIn[gid];
+    if (gid >= totalNodes) return;
+    uint idx = gid;
+
+    // Only process nodes on the current frontier
+    if (reachableLabels[idx] != (int)current_bfs_level) return;
 
     uint x = idx % width;
     uint y = idx / width;
@@ -528,19 +526,16 @@ kernel void finalCutBfsTraverse_SourceSet_Kernel(const device uint* levelIn [[bu
         if (nx < 0 || nx >= int(width) || ny < 0 || ny >= int(height)) continue;
 
         uint nidx = ny * width + nx;
-        if (reachableLabels[nidx] != 0) continue; // Already visited
-
+        
         // Check residual capacity from current node to neighbor (forward edge).
-        // For source-set reachability, we traverse forward in the residual graph.
         float residual = fload(&resBuf[idx].c[k]);
 
         if (residual > 1e-6f) {
+            // If neighbor is unvisited (label 0), try to claim it for the next level
             int expected = 0;
-            if (atomic_compare_exchange_weak_explicit((device atomic_int*)&reachableLabels[nidx], &expected, 1,
-                                                     memory_order_relaxed, memory_order_relaxed)) {
-                uint pos = atomic_fetch_add_explicit(nextCount, 1u, memory_order_relaxed);
-                levelOut[pos] = nidx;
-            }
+            int new_label = current_bfs_level + 1;
+            atomic_compare_exchange_weak_explicit((device atomic_int*)&reachableLabels[nidx], &expected, new_label,
+                                                     memory_order_relaxed, memory_order_relaxed);
         }
     }
 }
